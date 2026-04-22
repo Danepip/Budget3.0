@@ -906,7 +906,7 @@ function renderSectionHeading() {
   refs.cardsKicker.textContent = "Journalier";
   refs.cardsTitle.textContent = "Les ecritures deviennent des fiches";
   refs.cardsCaption.textContent =
-    "Cette vue utilise Journalier!D:F et garde la liste de categories de Journalier!B.";
+    "Cette vue utilise Journalier!D:F, garde la liste de categories de Journalier!B et reprend le meme filtre annee/mois que le recapitulatif.";
 }
 
 function renderControls() {
@@ -921,10 +921,10 @@ function renderControls() {
   refs.searchInput.placeholder = recapActive
     ? "Chercher un poste ou une categorie du recap..."
     : "Categorie, date, valeur...";
-  refs.recapYearField.classList.toggle("hidden", !recapActive);
-  refs.recapMonthField.classList.toggle("hidden", !recapActive);
-  refs.recapYearSelect.disabled = !recapActive || !availableYears.length;
-  refs.recapMonthSelect.disabled = !recapActive || !availableMonths.length;
+  refs.recapYearField.classList.toggle("hidden", !hasBudget);
+  refs.recapMonthField.classList.toggle("hidden", !hasBudget);
+  refs.recapYearSelect.disabled = !hasBudget || !availableYears.length;
+  refs.recapMonthSelect.disabled = !hasBudget || !availableMonths.length;
   refs.addButton.disabled = !journalActive;
   refs.exportButton.disabled = !hasBudget || !state.workbook || !window.XLSX;
   refs.saveButton.disabled = !journalActive;
@@ -968,7 +968,9 @@ function renderStats() {
   refs.columnsCount.textContent = "3";
   refs.activeSheet.textContent = JOURNAL_SHEET_NAME;
   refs.lastAction.textContent = state.lastAction;
-  refs.metricMode.textContent = "Journalier card view";
+  refs.metricMode.textContent = hasActiveRecapPeriodFilter()
+    ? `Journalier card view - ${buildRecapPeriodLabel()}`
+    : "Journalier card view";
   refs.metricFile.textContent = state.workbookName || "Aucun fichier";
   refs.metricSave.textContent = state.workbook
     ? getExportCapabilityLabel()
@@ -985,6 +987,10 @@ function getFilteredJournalRows() {
   return state.budget.rows
     .map((row, index) => ({ row, index }))
     .filter(({ row }) => {
+      if (hasActiveRecapPeriodFilter() && !matchesRecapPeriod(row)) {
+        return false;
+      }
+
       if (!query) {
         return true;
       }
@@ -1039,10 +1045,7 @@ function renderJournalCards() {
 
   if (!filteredRows.length) {
     refs.cardsEmpty.classList.remove("hidden");
-    refs.cardsEmpty.innerHTML = [
-      "<strong>Aucune transaction ne correspond a la recherche.</strong>",
-      "<p>Essayez un autre mot-cle ou ajoutez une nouvelle fiche.</p>",
-    ].join("");
+    refs.cardsEmpty.innerHTML = buildJournalEmptyStateMarkup();
     return;
   }
 
@@ -1098,6 +1101,27 @@ function renderRecapView() {
 
   refs.cardsEmpty.classList.add("hidden");
   refs.recapView.innerHTML = createRecapMarkup(recapView);
+}
+
+function buildJournalEmptyStateMarkup() {
+  if (hasActiveRecapPeriodFilter() && state.search) {
+    return [
+      "<strong>Aucune transaction ne correspond a la recherche pour cette periode.</strong>",
+      "<p>Essayez un autre mot-cle ou elargissez le filtre annee/mois.</p>",
+    ].join("");
+  }
+
+  if (hasActiveRecapPeriodFilter()) {
+    return [
+      "<strong>Aucune transaction pour la periode choisie.</strong>",
+      "<p>Changez le filtre annee/mois ou ajoutez une nouvelle fiche datee dans cette periode.</p>",
+    ].join("");
+  }
+
+  return [
+    "<strong>Aucune transaction ne correspond a la recherche.</strong>",
+    "<p>Essayez un autre mot-cle ou ajoutez une nouvelle fiche.</p>",
+  ].join("");
 }
 
 function buildLiveRecapView() {
