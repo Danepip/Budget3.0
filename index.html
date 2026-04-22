@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Budget 2025 Card View</title>
+  <meta name="theme-color" content="#18333b">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Budget 2025">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="format-detection" content="telephone=no">
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icon-app.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icon-192.svg">
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <div class="page-shell">
+    <header class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">Budget 2025</p>
+        <h1>Pilotez votre classeur en card view</h1>
+        <p class="hero-text">
+          Cette app est configuree pour <strong>Budget_2025 Final.xlsx</strong>.
+          Elle lit la feuille <strong>Journalier</strong>, utilise la liste de categories
+          de la colonne <strong>B</strong>, puis affiche la saisie <strong>Date / Categories / Value</strong>
+          de la zone <strong>D:F</strong> sous forme de fiches.
+        </p>
+      </div>
+
+      <div class="hero-panel">
+        <div class="hero-metric">
+          <span class="metric-label">Mode de travail</span>
+          <strong id="metric-mode">Pret pour l'import</strong>
+        </div>
+        <div class="hero-metric">
+          <span class="metric-label">Fichier actif</span>
+          <strong id="metric-file">Aucun fichier</strong>
+        </div>
+        <div class="hero-metric">
+          <span class="metric-label">Export</span>
+          <strong id="metric-save">Chargez le fichier</strong>
+        </div>
+
+        <div class="hero-mobile-actions">
+          <button id="install-app" class="button secondary hidden" type="button">Installer l'app</button>
+          <p id="app-shell-status" class="shell-status">
+            Version locale ouverte dans le navigateur.
+          </p>
+        </div>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="toolbar panel">
+        <div class="toolbar-primary">
+          <label class="file-picker" for="excel-file">
+            <span class="file-picker-label">Charger Budget_2025 Final</span>
+            <span class="file-picker-hint">.xlsx recommande</span>
+          </label>
+          <input id="excel-file" type="file" accept=".xlsx,.xls,.csv">
+
+          <label class="control-field">
+            <span>Vue</span>
+            <select id="sheet-select" disabled>
+              <option value="">Aucune feuille</option>
+            </select>
+          </label>
+
+          <label class="control-field hidden" id="recap-year-field">
+            <span>Annee</span>
+            <select id="recap-year-select" disabled>
+              <option value="all">Toutes les annees</option>
+            </select>
+          </label>
+
+          <label class="control-field hidden" id="recap-month-field">
+            <span>Mois</span>
+            <select id="recap-month-select" disabled>
+              <option value="all">Tous les mois</option>
+            </select>
+          </label>
+
+          <label class="control-field search-field">
+            <span>Recherche</span>
+            <input id="search-input" type="search" placeholder="Categorie, date, valeur..." disabled>
+          </label>
+        </div>
+
+        <div class="toolbar-actions">
+          <button id="add-record" class="button secondary" type="button" disabled>Nouvelle fiche</button>
+          <button id="export-workbook" class="button primary" type="button" disabled>Exporter Excel</button>
+        </div>
+      </section>
+
+      <section class="status-strip">
+        <article class="status-card panel">
+          <span class="status-label" id="records-label">Transactions</span>
+          <strong id="records-count">0</strong>
+        </article>
+        <article class="status-card panel">
+          <span class="status-label" id="columns-label">Champs</span>
+          <strong id="columns-count">0</strong>
+        </article>
+        <article class="status-card panel">
+          <span class="status-label">Feuille active</span>
+          <strong id="active-sheet">Aucune</strong>
+        </article>
+        <article class="status-card panel">
+          <span class="status-label">Derniere action</span>
+          <strong id="last-action">En attente</strong>
+        </article>
+      </section>
+
+      <p id="library-warning" class="library-warning hidden">
+        La bibliotheque Excel n'est pas chargee. Verifiez votre connexion internet puis rechargez la page.
+      </p>
+
+      <div class="layout">
+        <section class="cards-area panel">
+          <div class="section-heading">
+            <div>
+              <p class="section-kicker" id="cards-kicker">Journalier</p>
+              <h2 id="cards-title">Les ecritures deviennent des fiches</h2>
+            </div>
+            <p class="section-caption" id="cards-caption">
+              Cette vue utilise Journalier!D:F et garde la liste de categories de Journalier!B.
+            </p>
+          </div>
+
+          <div id="cards-empty" class="empty-state">
+            <strong>Chargez Budget_2025 Final.xlsx pour commencer.</strong>
+            <p>
+              Une fois le fichier importe, chaque transaction du journal sera affichee
+              en carte et vous pourrez la modifier a droite.
+            </p>
+          </div>
+
+          <div id="cards-grid" class="cards-grid"></div>
+          <div id="recap-view" class="recap-view hidden"></div>
+        </section>
+
+        <aside class="editor-area panel">
+          <div class="section-heading editor-heading">
+            <div>
+              <p class="section-kicker">Formulaire</p>
+              <h2 id="form-title">Nouvelle fiche</h2>
+            </div>
+            <p id="form-subtitle" class="section-caption">
+              Chargez d'abord Budget_2025 Final.xlsx pour afficher le formulaire Journalier.
+            </p>
+          </div>
+
+          <form id="record-form" novalidate>
+            <div id="form-fields" class="form-fields">
+              <div class="empty-form">
+                Les champs Date / Categories / Value apparaitront ici.
+              </div>
+            </div>
+
+            <div class="form-actions">
+              <button class="button primary" type="submit" id="save-record" disabled>Enregistrer</button>
+              <button class="button ghost" type="button" id="cancel-edit" disabled>Reinitialiser</button>
+            </div>
+          </form>
+        </aside>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

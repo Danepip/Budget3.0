@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Budget 2025 - Hors ligne</title>
+  <meta name="theme-color" content="#18333b">
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #18333b;
+      --muted: #5f7278;
+      --accent: #d56a3f;
+      --teal: #2f7d74;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      font-family: "Trebuchet MS", "Segoe UI Variable", Verdana, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(255, 201, 165, 0.92), transparent 34%),
+        radial-gradient(circle at 88% 12%, rgba(101, 180, 165, 0.36), transparent 22%),
+        linear-gradient(155deg, #fff4ea 0%, #f8fbfa 48%, #d8efe8 100%);
+    }
+
+    .shell {
+      width: min(540px, 100%);
+      padding: 28px;
+      border-radius: 28px;
+      background: rgba(255, 252, 248, 0.9);
+      border: 1px solid rgba(24, 51, 59, 0.1);
+      box-shadow: 0 24px 55px rgba(25, 45, 51, 0.12);
+    }
+
+    .eyebrow {
+      margin: 0 0 10px;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      font-size: 0.78rem;
+      font-weight: 700;
+    }
+
+    h1 {
+      margin: 0 0 12px;
+      font-family: "Palatino Linotype", Georgia, serif;
+      font-size: clamp(2rem, 5vw, 3rem);
+      line-height: 1.05;
+    }
+
+    p {
+      margin: 0 0 14px;
+      line-height: 1.6;
+      color: var(--muted);
+    }
+
+    .badge {
+      display: inline-flex;
+      margin-top: 8px;
+      padding: 9px 12px;
+      border-radius: 999px;
+      background: rgba(47, 125, 116, 0.12);
+      color: var(--teal);
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <p class="eyebrow">Budget 2025</p>
+    <h1>Connexion requise pour continuer</h1>
+    <p>
+      L'interface de l'app est bien installee, mais certains fichiers ou la bibliotheque Excel
+      ne sont pas encore disponibles hors ligne sur cet appareil.
+    </p>
+    <p>
+      Reouvrez l'app une fois avec Internet pour finaliser le cache, puis vous pourrez revenir
+      plus facilement meme si la connexion coupe.
+    </p>
+    <span class="badge">Mode hors ligne de base actif</span>
+  </main>
+</body>
+</html>
