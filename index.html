@@ -15,7 +15,11 @@
   <link rel="icon" href="icon-app.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" sizes="180x180" href="apple-touch-icon.png">
   <link rel="stylesheet" href="styles.css">
-  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="vendor/capacitor.js"></script>
+  <script src="vendor/synapse.js"></script>
+  <script src="vendor/capacitor-filesystem.js"></script>
+  <script src="vendor/capacitor-share.js"></script>
+  <script src="vendor/xlsx.full.min.js"></script>
   <script defer src="app.js"></script>
 </head>
 <body>
@@ -117,7 +121,7 @@
       </section>
 
       <p id="library-warning" class="library-warning hidden">
-        La bibliotheque Excel n'est pas chargee. Verifiez votre connexion internet puis rechargez la page.
+        La bibliotheque Excel n'est pas chargee. Verifiez que les fichiers du dossier <code>vendor</code> sont bien presents puis rechargez la page.
       </p>
 
       <div class="layout">

@@ -646,7 +646,7 @@ function onSaveRecord(event) {
   renderAll();
 }
 
-function exportWorkbook() {
+async function exportWorkbook() {
   if (!window.XLSX) {
     setLastAction("Export impossible: bibliotheque Excel absente");
     renderStats();
@@ -661,19 +661,115 @@ function exportWorkbook() {
 
   try {
     applyBudgetRowsToWorkbook(state.workbook, state.budget);
+    const exportFileName = buildExportFileName();
 
-    const baseName = state.workbookName
-      ? state.workbookName.replace(/\.(xlsx|xls)$/i, "")
-      : "Budget_2025 Final";
+    if (canUseNativeExcelExport()) {
+      setLastAction("Preparation du fichier Excel pour l'app mobile");
+      renderStats();
+      await exportWorkbookWithNativeShare(state.workbook, exportFileName);
+      setLastAction("Classeur exporte et partage depuis l'app mobile");
+    } else {
+      XLSX.writeFile(state.workbook, exportFileName);
+      setLastAction("Classeur exporte avec Journalier mis a jour");
+    }
 
-    XLSX.writeFile(state.workbook, `${baseName}-card-view.xlsx`);
-    setLastAction("Classeur exporte avec Journalier mis a jour");
     renderStats();
   } catch (error) {
     console.error(error);
-    setLastAction("L'export a echoue");
+    setLastAction(buildExportErrorMessage(error));
     renderStats();
   }
+}
+
+function buildExportFileName() {
+  const baseName = state.workbookName
+    ? state.workbookName.replace(/\.(xlsx|xls)$/i, "")
+    : "Budget_2025 Final";
+
+  return `${sanitizeExportFileName(baseName)}-card-view.xlsx`;
+}
+
+function sanitizeExportFileName(value) {
+  const normalized = String(value || "")
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return normalized || "Budget_2025 Final";
+}
+
+function getCapacitorRuntime() {
+  return window.Capacitor || null;
+}
+
+function getFilesystemPlugin() {
+  return window.capacitorFilesystemPluginCapacitor?.Filesystem || null;
+}
+
+function getFilesystemDirectory() {
+  return window.capacitorFilesystemPluginCapacitor?.FilesystemDirectory || null;
+}
+
+function getSharePlugin() {
+  return window.capacitorShare?.Share || null;
+}
+
+function isNativeAppRuntime() {
+  return Boolean(getCapacitorRuntime()?.isNativePlatform?.());
+}
+
+function canUseNativeExcelExport() {
+  return Boolean(
+    isNativeAppRuntime() &&
+      getFilesystemPlugin() &&
+      getSharePlugin() &&
+      getFilesystemDirectory()?.Cache
+  );
+}
+
+async function exportWorkbookWithNativeShare(workbook, fileName) {
+  const Filesystem = getFilesystemPlugin();
+  const Share = getSharePlugin();
+  const Directory = getFilesystemDirectory();
+  const shareSupport = typeof Share.canShare === "function" ? await Share.canShare() : { value: true };
+
+  if (!shareSupport?.value) {
+    throw new Error("Le partage natif n'est pas disponible sur cet appareil");
+  }
+
+  const relativePath = `exports/${fileName}`;
+  const workbookData = XLSX.write(workbook, {
+    bookType: "xlsx",
+    type: "base64",
+  });
+
+  await Filesystem.writeFile({
+    path: relativePath,
+    data: workbookData,
+    directory: Directory.Cache,
+    recursive: true,
+  });
+
+  const fileUri = await Filesystem.getUri({
+    path: relativePath,
+    directory: Directory.Cache,
+  });
+
+  await Share.share({
+    title: "Budget 2025",
+    text: "Classeur Budget 2025 exporte depuis l'app mobile.",
+    files: [fileUri.uri],
+    dialogTitle: "Partager le classeur Excel",
+  });
+}
+
+function buildExportErrorMessage(error) {
+  const rawMessage = String(error?.message || "").toLowerCase();
+  if (rawMessage.includes("share")) {
+    return "L'export a echoue: partage natif indisponible";
+  }
+
+  return "L'export a echoue";
 }
 
 function applyBudgetRowsToWorkbook(workbook, budgetModel) {
@@ -860,7 +956,7 @@ function renderStats() {
     refs.metricMode.textContent = `Vue recap - ${recapView.periodLabel}`;
     refs.metricFile.textContent = state.workbookName || "Aucun fichier";
     refs.metricSave.textContent = state.workbook
-      ? "Export vers le classeur"
+      ? getExportCapabilityLabel()
       : "Rechargez le fichier pour exporter";
     return;
   }
@@ -875,8 +971,12 @@ function renderStats() {
   refs.metricMode.textContent = "Journalier card view";
   refs.metricFile.textContent = state.workbookName || "Aucun fichier";
   refs.metricSave.textContent = state.workbook
-    ? "Export vers le classeur"
+    ? getExportCapabilityLabel()
     : "Rechargez le fichier pour exporter";
+}
+
+function getExportCapabilityLabel() {
+  return canUseNativeExcelExport() ? "Partage natif Excel" : "Export vers le classeur";
 }
 
 function getFilteredJournalRows() {
