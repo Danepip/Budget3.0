@@ -2,6 +2,7 @@ const STORAGE_KEY = "budget-2025-card-view-v2";
 
 const JOURNAL_SHEET_NAME = "Journalier";
 const RECAP_SHEET_NAME = "Recapitulatif";
+const ANALYSIS_VIEW_NAME = "Comparaisons";
 const TCD_SHEET_NAME = "TCD";
 
 const DATE_COL = "D";
@@ -14,6 +15,9 @@ const START_ROW = 3;
 const state = {
   workbookName: "",
   workbook: null,
+  sourceLink: null,
+  sourceSafety: createEmptySourceSafety(),
+  draftSavedAt: "",
   mode: "idle",
   activeView: JOURNAL_SHEET_NAME,
   search: "",
@@ -28,6 +32,8 @@ const state = {
 const refs = {};
 let deferredInstallPrompt = null;
 let appShellReady = false;
+let sourceSaveQueue = Promise.resolve();
+let budgetSourcePlugin = null;
 
 document.addEventListener("DOMContentLoaded", () => {
   cacheDom();
@@ -62,6 +68,22 @@ function createEmptyRecapFilters() {
   };
 }
 
+function createEmptySourceSafety() {
+  return {
+    allowDirectWrite: false,
+    reason: "Ecriture directe desactivee pour proteger l'integrite du classeur source.",
+    issues: [],
+  };
+}
+
+function normalizeActiveView(value) {
+  if (value === RECAP_SHEET_NAME || value === ANALYSIS_VIEW_NAME) {
+    return value;
+  }
+
+  return JOURNAL_SHEET_NAME;
+}
+
 function cacheDom() {
   refs.fileInput = document.getElementById("excel-file");
   refs.sheetSelect = document.getElementById("sheet-select");
@@ -70,6 +92,10 @@ function cacheDom() {
   refs.recapMonthField = document.getElementById("recap-month-field");
   refs.recapMonthSelect = document.getElementById("recap-month-select");
   refs.searchInput = document.getElementById("search-input");
+  refs.openSourceButton = document.getElementById("open-source");
+  refs.saveSourceButton = document.getElementById("save-source");
+  refs.saveDraftButton = document.getElementById("save-draft");
+  refs.restoreDraftButton = document.getElementById("restore-draft");
   refs.addButton = document.getElementById("add-record");
   refs.exportButton = document.getElementById("export-workbook");
   refs.cardsGrid = document.getElementById("cards-grid");
@@ -90,6 +116,7 @@ function cacheDom() {
   refs.metricMode = document.getElementById("metric-mode");
   refs.metricFile = document.getElementById("metric-file");
   refs.metricSave = document.getElementById("metric-save");
+  refs.draftStatus = document.getElementById("draft-status");
   refs.installButton = document.getElementById("install-app");
   refs.appShellStatus = document.getElementById("app-shell-status");
   refs.libraryWarning = document.getElementById("library-warning");
@@ -101,6 +128,12 @@ function cacheDom() {
 
 function bindEvents() {
   refs.fileInput.addEventListener("change", onFileSelected);
+  refs.openSourceButton.addEventListener("click", onOpenSourceRequested);
+  refs.saveSourceButton.addEventListener("click", () => {
+    void saveSourceWorkbook();
+  });
+  refs.saveDraftButton.addEventListener("click", onSaveDraftRequested);
+  refs.restoreDraftButton.addEventListener("click", onRestoreDraftRequested);
   refs.sheetSelect.addEventListener("change", onViewChanged);
   refs.recapYearSelect.addEventListener("change", onRecapYearChanged);
   refs.recapMonthSelect.addEventListener("change", onRecapMonthChanged);
@@ -238,44 +271,18 @@ function isAppleMobileDevice() {
   return /iphone|ipad|ipod/i.test(window.navigator.userAgent || "");
 }
 
-function restoreDraft() {
+function readStoredDraft() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) {
-      return;
+      return null;
     }
 
     const draft = JSON.parse(raw);
-    if (draft.mode !== "budget" || !Array.isArray(draft.rows)) {
-      return;
-    }
-
-    state.mode = "budget";
-    state.workbookName = draft.workbookName || "";
-    state.activeView = draft.activeView === RECAP_SHEET_NAME ? RECAP_SHEET_NAME : JOURNAL_SHEET_NAME;
-    state.budget = {
-      headers: ["Date", "Categories", "Value"],
-      categories: Array.isArray(draft.categories) ? draft.categories : [],
-      rows: draft.rows.map((row) => sanitizeBudgetRow(row)),
-      clearEndRow: Number.isFinite(draft.clearEndRow) ? draft.clearEndRow : START_ROW,
-    };
-    state.recap = {
-      available: Boolean(draft.recap?.available),
-      snapshotDate: String(draft.recap?.snapshotDate || ""),
-      planTemplate: Array.isArray(draft.recap?.planTemplate)
-        ? draft.recap.planTemplate.map((row) => ({
-            label: String(row?.label || ""),
-            plan: normalizeAmountValue(row?.plan),
-          }))
-        : [],
-    };
-    state.recapFilters = {
-      year: String(draft.recapFilters?.year || "all"),
-      month: String(draft.recapFilters?.month || "all"),
-    };
-    state.lastAction = "Brouillon restaure. Rechargez le fichier pour exporter.";
+    return draft && typeof draft === "object" ? draft : null;
   } catch (error) {
     console.error(error);
+    return null;
   }
 }
 
@@ -300,7 +307,84 @@ function persistDraft() {
     savedAt: new Date().toISOString(),
   };
 
+  state.draftSavedAt = payload.savedAt;
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
+}
+
+function applyStoredDraft(draft) {
+  state.mode = "budget";
+  state.workbookName = draft.workbookName || "";
+  state.workbook = null;
+  state.sourceLink = null;
+  state.activeView = normalizeActiveView(draft.activeView);
+  state.search = "";
+  state.editingIndex = null;
+  state.editorMode = "create";
+  state.budget = {
+    headers: ["Date", "Categories", "Value"],
+    categories: Array.isArray(draft.categories) ? draft.categories : [],
+    rows: draft.rows.map((row) => sanitizeBudgetRow(row)),
+    clearEndRow: Number.isFinite(draft.clearEndRow) ? draft.clearEndRow : START_ROW,
+  };
+  state.recap = {
+    available: Boolean(draft.recap?.available),
+    snapshotDate: String(draft.recap?.snapshotDate || ""),
+    planTemplate: Array.isArray(draft.recap?.planTemplate)
+      ? draft.recap.planTemplate.map((row) => ({
+          label: String(row?.label || ""),
+          plan: normalizeAmountValue(row?.plan),
+        }))
+      : [],
+  };
+  state.recapFilters = {
+    year: String(draft.recapFilters?.year || "all"),
+    month: String(draft.recapFilters?.month || "all"),
+  };
+  state.sourceSafety = createEmptySourceSafety();
+  state.draftSavedAt = String(draft.savedAt || "");
+
+  if (refs.searchInput) {
+    refs.searchInput.value = "";
+  }
+
+  if (refs.fileInput) {
+    refs.fileInput.value = "";
+  }
+}
+
+function restoreDraft(options = {}) {
+  const manual = Boolean(options.manual);
+  const draft = readStoredDraft();
+
+  if (!draft || draft.mode !== "budget" || !Array.isArray(draft.rows)) {
+    if (manual) {
+      setLastAction("Aucun brouillon local a restaurer.");
+    }
+    return false;
+  }
+
+  applyStoredDraft(draft);
+  state.lastAction = manual
+    ? "Brouillon local restaure. Mode autonome actif avec vos donnees locales."
+    : "Brouillon restaure. Mode autonome actif avec vos donnees locales.";
+  return true;
+}
+
+function onSaveDraftRequested() {
+  if (state.mode !== "budget") {
+    setLastAction("Chargez ou restaurez un budget avant de sauvegarder en local.");
+    renderAll();
+    return;
+  }
+
+  persistDraft();
+  setLastAction("Sauvegarde locale mise a jour.");
+  renderAll();
+}
+
+function onRestoreDraftRequested() {
+  restoreDraft({ manual: true });
+  renderAll();
 }
 
 async function onFileSelected(event) {
@@ -317,54 +401,150 @@ async function onFileSelected(event) {
   }
 
   try {
-    const buffer = await file.arrayBuffer();
-    const workbook = XLSX.read(buffer, {
-      type: "array",
-      cellDates: true,
-      cellFormula: true,
-      cellNF: true,
+    await importWorkbookFile(file, {
+      sourceLink: null,
+      successMessage: `Classeur charge: ${file.name}`,
     });
-
-    if (!isBudgetWorkbook(workbook)) {
-      state.workbookName = file.name;
-      state.workbook = null;
-      state.mode = "idle";
-      state.activeView = JOURNAL_SHEET_NAME;
-      state.search = "";
-      state.editingIndex = null;
-      state.editorMode = "create";
-      state.budget = createEmptyBudgetModel();
-      state.recap = createEmptyRecapModel();
-      state.recapFilters = createEmptyRecapFilters();
-      refs.searchInput.value = "";
-      refs.fileInput.value = "";
-      setLastAction("Ce prototype attend Budget_2025 Final.xlsx");
-      renderAll();
-      return;
-    }
-
-    state.workbookName = file.name;
-    state.workbook = workbook;
-    state.mode = "budget";
-    state.activeView = JOURNAL_SHEET_NAME;
-    state.search = "";
-    state.editingIndex = null;
-    state.editorMode = "create";
-    state.budget = parseBudgetWorkbook(workbook);
-    state.recap = parseRecapWorkbook(workbook);
-
-    refs.searchInput.value = "";
-    refs.fileInput.value = "";
-
-    persistDraft();
-    setLastAction(`Classeur charge: ${file.name}`);
-    renderAll();
   } catch (error) {
     console.error(error);
     state.workbook = null;
+    state.sourceLink = null;
     setLastAction("Le fichier n'a pas pu etre lu");
     renderAll();
   }
+}
+
+async function onOpenSourceRequested() {
+  if (!window.XLSX) {
+    setLastAction("Import impossible: bibliotheque Excel absente");
+    renderStats();
+    return;
+  }
+
+  if (!canUseSourceLinkPicker()) {
+    setLastAction(buildSourceLinkUnavailableMessage());
+    renderStats();
+    return;
+  }
+
+  try {
+    if (canUseAndroidSourcePicker()) {
+      const sourceResult = await getBudgetSourcePlugin().pickSource();
+      if (!sourceResult?.data) {
+        throw new Error("Aucune donnee recue depuis la source Android");
+      }
+
+      await importWorkbookBuffer(base64ToArrayBuffer(sourceResult.data), sourceResult.name || "Budget_2025 Final.xlsx", {
+        sourceLink: {
+          kind: "android-document",
+          uri: String(sourceResult.uri || ""),
+          name: String(sourceResult.name || ""),
+        },
+        successMessage: `Source liee: ${sourceResult.name || "Budget_2025 Final.xlsx"}`,
+      });
+      return;
+    }
+
+    const [handle] = await window.showOpenFilePicker({
+      multiple: false,
+      types: [
+        {
+          description: "Classeur Excel Budget",
+          accept: {
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": [".xlsx"],
+            "application/vnd.ms-excel": [".xls"],
+          },
+        },
+      ],
+    });
+
+    if (!handle) {
+      return;
+    }
+
+    const file = await handle.getFile();
+    await importWorkbookFile(file, {
+      sourceLink: {
+        kind: "file-handle",
+        handle,
+      },
+      successMessage: `Source liee: ${file.name}`,
+    });
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      setLastAction("Liaison de la source annulee");
+      renderStats();
+      return;
+    }
+
+    console.error(error);
+    setLastAction("La source n'a pas pu etre ouverte avec ecriture");
+    renderStats();
+  }
+}
+
+async function importWorkbookFile(file, options = {}) {
+  const buffer = await file.arrayBuffer();
+  await importWorkbookBuffer(buffer, file.name, options);
+}
+
+async function importWorkbookBuffer(buffer, fileName, options = {}) {
+  const workbook = XLSX.read(buffer, {
+    type: "array",
+    cellDates: true,
+    cellFormula: true,
+    cellNF: true,
+    cellStyles: true,
+    bookFiles: true,
+    bookVBA: true,
+  });
+
+  if (!isBudgetWorkbook(workbook)) {
+    resetBudgetStateForInvalidWorkbook(fileName);
+    return;
+  }
+
+  state.workbookName = fileName;
+  state.workbook = workbook;
+  state.sourceLink = options.sourceLink || null;
+  state.sourceSafety = analyzeWorkbookSourceSafety(workbook, fileName);
+  state.mode = "budget";
+  state.activeView = JOURNAL_SHEET_NAME;
+  state.search = "";
+  state.editingIndex = null;
+  state.editorMode = "create";
+  state.budget = parseBudgetWorkbook(workbook);
+  state.recap = parseRecapWorkbook(workbook);
+
+  refs.searchInput.value = "";
+  refs.fileInput.value = "";
+
+  persistDraft();
+  setLastAction(
+    state.sourceSafety.allowDirectWrite
+      ? options.successMessage || `Classeur charge: ${fileName}`
+      : `${options.successMessage || `Classeur charge: ${fileName}`} - source protegee, export copie uniquement`
+  );
+  renderAll();
+}
+
+function resetBudgetStateForInvalidWorkbook(fileName) {
+  state.workbookName = fileName;
+  state.workbook = null;
+  state.sourceLink = null;
+  state.sourceSafety = createEmptySourceSafety();
+  state.mode = "idle";
+  state.activeView = JOURNAL_SHEET_NAME;
+  state.search = "";
+  state.editingIndex = null;
+  state.editorMode = "create";
+  state.budget = createEmptyBudgetModel();
+  state.recap = createEmptyRecapModel();
+  state.recapFilters = createEmptyRecapFilters();
+  refs.searchInput.value = "";
+  refs.fileInput.value = "";
+  setLastAction("Ce prototype attend Budget_2025 Final.xlsx");
+  renderAll();
 }
 
 function isBudgetWorkbook(workbook) {
@@ -379,6 +559,61 @@ function isBudgetWorkbook(workbook) {
   const b2 = normalizeHeaderName(readCellText(sheet[`${CATEGORY_LIST_COL}${HEADER_ROW}`]));
 
   return d2 === "date" && e2.startsWith("categorie") && f2 === "value" && b2.startsWith("categorie");
+}
+
+function analyzeWorkbookSourceSafety(workbook, fileName) {
+  const issues = [];
+  const rawKeys = Array.isArray(workbook?.keys)
+    ? workbook.keys
+    : Object.keys(workbook?.files || {});
+  const normalizedKeys = rawKeys.map((value) => String(value || ""));
+  const definedNames = Array.isArray(workbook?.Workbook?.Names) ? workbook.Workbook.Names : [];
+  const normalizedSheetNames = new Set((workbook?.SheetNames || []).map((value) => String(value || "").trim().toLowerCase()));
+
+  if (
+    normalizedKeys.some((value) =>
+      /^xl\/(pivotTables|pivotCache|drawings|charts|slicers|externalLinks|persons|threadedComments|ctrlProps|connections)/i.test(
+        value
+      )
+    )
+  ) {
+    issues.push("objets Excel avances");
+  }
+
+  if (
+    definedNames.some((item) => {
+      const reference = String(item?.Ref || "");
+      return reference.includes("#REF!") || /\[\d+\]/.test(reference);
+    })
+  ) {
+    issues.push("noms definis ou liaisons complexes");
+  }
+
+  if (
+    normalizedSheetNames.has("journalier") &&
+    normalizedSheetNames.has("recapitulatif") &&
+    normalizedSheetNames.has("tcd")
+  ) {
+    issues.push("modele Budget 2025 structure");
+  }
+
+  if (/budget_2025 final/i.test(String(fileName || ""))) {
+    issues.push("classeur source sensible");
+  }
+
+  if (!issues.length) {
+    return {
+      allowDirectWrite: false,
+      reason: "Ecriture directe desactivee pour proteger l'integrite du classeur source.",
+      issues: ["ecriture source preservee par precaution"],
+    };
+  }
+
+  return {
+    allowDirectWrite: false,
+    reason: `Ecriture directe desactivee: ${issues.join(", ")}. Utilisez Exporter Excel sur une copie pour proteger le fichier source.`,
+    issues,
+  };
 }
 
 function parseBudgetWorkbook(workbook) {
@@ -498,7 +733,7 @@ function isIgnoredRecapLabel(label) {
 }
 
 function onViewChanged(event) {
-  state.activeView = event.target.value === RECAP_SHEET_NAME ? RECAP_SHEET_NAME : JOURNAL_SHEET_NAME;
+  state.activeView = normalizeActiveView(event.target.value);
   state.search = "";
   refs.searchInput.value = "";
   state.editorMode = "create";
@@ -562,7 +797,7 @@ function onCardAction(event) {
   }
 
   if (deleteButton) {
-    deleteRecord(index);
+    void deleteRecord(index);
     return;
   }
 
@@ -581,7 +816,7 @@ function openEditor(index) {
   renderAll();
 }
 
-function deleteRecord(index) {
+async function deleteRecord(index) {
   const target = state.budget.rows[index];
   if (!target) {
     return;
@@ -604,11 +839,16 @@ function deleteRecord(index) {
   }
 
   persistDraft();
-  setLastAction(`Transaction supprimee: ${title}`);
+  const actionLabel = `Transaction supprimee: ${title}`;
+  setLastAction(actionLabel);
   renderAll();
+  await enqueueSourceSave({
+    automatic: true,
+    baseAction: actionLabel,
+  });
 }
 
-function onSaveRecord(event) {
+async function onSaveRecord(event) {
   event.preventDefault();
 
   if (state.mode !== "budget") {
@@ -629,13 +869,16 @@ function onSaveRecord(event) {
     return;
   }
 
+  let actionLabel = "Transaction enregistree";
   if (state.editorMode === "edit" && state.editingIndex !== null && state.budget.rows[state.editingIndex]) {
     nextRecord.__id = state.budget.rows[state.editingIndex].__id;
     state.budget.rows[state.editingIndex] = nextRecord;
-    setLastAction("Transaction mise a jour");
+    actionLabel = "Transaction mise a jour";
+    setLastAction(actionLabel);
   } else {
     state.budget.rows.push(nextRecord);
-    setLastAction("Nouvelle transaction ajoutee");
+    actionLabel = "Nouvelle transaction ajoutee";
+    setLastAction(actionLabel);
   }
 
   sortBudgetRowsInPlace(state.budget.rows);
@@ -644,6 +887,10 @@ function onSaveRecord(event) {
 
   persistDraft();
   renderAll();
+  await enqueueSourceSave({
+    automatic: true,
+    baseAction: actionLabel,
+  });
 }
 
 async function exportWorkbook() {
@@ -653,24 +900,23 @@ async function exportWorkbook() {
     return;
   }
 
-  if (!state.workbook || state.mode !== "budget") {
-    setLastAction("Rechargez Budget_2025 Final.xlsx pour exporter le vrai classeur");
+  if (state.mode !== "budget") {
+    setLastAction("Chargez ou restaurez des donnees pour exporter une copie");
     renderStats();
     return;
   }
 
   try {
-    applyBudgetRowsToWorkbook(state.workbook, state.budget);
-    const exportFileName = buildExportFileName();
+    const exportPayload = buildExportPayload();
 
     if (canUseNativeExcelExport()) {
-      setLastAction("Preparation du fichier Excel pour l'app mobile");
+      setLastAction(exportPayload.preparingMessage);
       renderStats();
-      await exportWorkbookWithNativeShare(state.workbook, exportFileName);
-      setLastAction("Classeur exporte et partage depuis l'app mobile");
+      await exportWorkbookWithNativeShare(exportPayload.workbook, exportPayload.fileName);
+      setLastAction(exportPayload.sharedMessage);
     } else {
-      XLSX.writeFile(state.workbook, exportFileName);
-      setLastAction("Classeur exporte avec Journalier mis a jour");
+      XLSX.writeFile(exportPayload.workbook, exportPayload.fileName);
+      setLastAction(exportPayload.successMessage);
     }
 
     renderStats();
@@ -681,12 +927,179 @@ async function exportWorkbook() {
   }
 }
 
+function buildExportPayload() {
+  if (shouldUseSimplifiedSafeExport()) {
+    return {
+      workbook: buildSimplifiedExportWorkbook(),
+      fileName: buildSimplifiedExportFileName(),
+      preparingMessage: "Preparation d'une copie simplifiee du journal",
+      sharedMessage: "Copie simplifiee du journal exportee et partagee depuis l'app mobile",
+      successMessage: "Copie simplifiee du journal exportee sans toucher au classeur source",
+    };
+  }
+
+  applyBudgetRowsToWorkbook(state.workbook, state.budget);
+
+  return {
+    workbook: state.workbook,
+    fileName: buildExportFileName(),
+    preparingMessage: "Preparation du fichier Excel pour l'app mobile",
+    sharedMessage: "Classeur exporte et partage depuis l'app mobile",
+    successMessage: "Classeur exporte avec Journalier mis a jour",
+  };
+}
+
+function shouldUseSimplifiedSafeExport() {
+  return Boolean(state.mode === "budget" && (!state.workbook || !state.sourceSafety.allowDirectWrite));
+}
+
+function enqueueSourceSave(options = {}) {
+  if (!canSaveToSource()) {
+    return Promise.resolve(false);
+  }
+
+  sourceSaveQueue = sourceSaveQueue
+    .catch(() => false)
+    .then(() => saveSourceWorkbook(options));
+
+  return sourceSaveQueue;
+}
+
+async function saveSourceWorkbook(options = {}) {
+  const automatic = Boolean(options.automatic);
+  const baseAction = String(options.baseAction || "");
+
+  if (!window.XLSX) {
+    if (!automatic) {
+      setLastAction("Enregistrement source impossible: bibliotheque Excel absente");
+      renderStats();
+    }
+    return false;
+  }
+
+  if (!state.workbook || state.mode !== "budget") {
+    if (!automatic) {
+      setLastAction("Chargez d'abord Budget_2025 Final.xlsx");
+      renderStats();
+    }
+    return false;
+  }
+
+  if (!canSaveToSource()) {
+    if (!automatic) {
+      setLastAction(buildSourceLinkUnavailableMessage());
+      renderStats();
+    }
+    return false;
+  }
+
+  try {
+    applyBudgetRowsToWorkbook(state.workbook, state.budget);
+    setLastAction(
+      automatic && baseAction
+        ? `${baseAction} - synchronisation de la source`
+        : "Ecriture en cours dans le fichier source"
+    );
+    renderStats();
+    await saveWorkbookToLinkedSource(state.workbook, state.sourceLink);
+    setLastAction(
+      automatic && baseAction
+        ? `${baseAction} - source mise a jour`
+        : `Fichier source mis a jour: ${state.workbookName}`
+    );
+  } catch (error) {
+    console.error(error);
+    setLastAction(automatic && baseAction ? `${baseAction} - ${buildSourceSaveErrorMessage(error)}` : buildSourceSaveErrorMessage(error));
+    renderStats();
+    return false;
+  }
+
+  renderStats();
+  return true;
+}
+
 function buildExportFileName() {
   const baseName = state.workbookName
     ? state.workbookName.replace(/\.(xlsx|xls)$/i, "")
     : "Budget_2025 Final";
 
   return `${sanitizeExportFileName(baseName)}-card-view.xlsx`;
+}
+
+function buildSimplifiedExportFileName() {
+  const baseName = state.workbookName
+    ? state.workbookName.replace(/\.(xlsx|xls)$/i, "")
+    : "Budget_2025 Final";
+
+  return `${sanitizeExportFileName(baseName)}-journalier-safe.xlsx`;
+}
+
+function buildSimplifiedExportWorkbook() {
+  const workbook = XLSX.utils.book_new();
+  const journalSheet = {};
+  const lastRow = START_ROW + Math.max(state.budget.rows.length, state.budget.categories.length) + 2;
+
+  journalSheet[`${CATEGORY_LIST_COL}${HEADER_ROW}`] = { t: "s", v: state.budget.headers[1] || "Categories" };
+  journalSheet[`${DATE_COL}${HEADER_ROW}`] = { t: "s", v: state.budget.headers[0] || "Date" };
+  journalSheet[`${CATEGORY_COL}${HEADER_ROW}`] = { t: "s", v: state.budget.headers[1] || "Categories" };
+  journalSheet[`${VALUE_COL}${HEADER_ROW}`] = { t: "s", v: state.budget.headers[2] || "Value" };
+
+  state.budget.categories.forEach((category, index) => {
+    journalSheet[`${CATEGORY_LIST_COL}${START_ROW + index}`] = {
+      t: "s",
+      v: category,
+    };
+  });
+
+  state.budget.rows.forEach((row, index) => {
+    const sheetRow = START_ROW + index;
+    const isoDate = normalizeDateValue(row.Date);
+    const amountNumber = parseAmount(row.Value);
+
+    if (isoDate) {
+      journalSheet[`${DATE_COL}${sheetRow}`] = {
+        t: "n",
+        v: isoDateToExcelSerial(isoDate),
+        z: "m/d/yyyy",
+      };
+    }
+
+    if (row.Categories) {
+      journalSheet[`${CATEGORY_COL}${sheetRow}`] = {
+        t: "s",
+        v: row.Categories,
+      };
+    }
+
+    if (Number.isFinite(amountNumber)) {
+      journalSheet[`${VALUE_COL}${sheetRow}`] = {
+        t: "n",
+        v: amountNumber,
+      };
+    } else if (row.Value) {
+      journalSheet[`${VALUE_COL}${sheetRow}`] = {
+        t: "s",
+        v: row.Value,
+      };
+    }
+  });
+
+  journalSheet["!ref"] = `B2:F${lastRow}`;
+
+  const infoSheet = XLSX.utils.aoa_to_sheet([
+    ["Budget 2025 Card View"],
+    ["Export simplifie du journal"],
+    [
+      "Cette copie preserve les transactions Journalier et la liste de categories, sans reecrire le modele Excel source complexe."
+    ],
+    ["Fichier source", state.workbookName || "Budget_2025 Final.xlsx"],
+    ["Date export", new Date().toISOString()],
+  ]);
+
+  XLSX.utils.book_append_sheet(workbook, infoSheet, "Infos");
+  XLSX.utils.book_append_sheet(workbook, journalSheet, JOURNAL_SHEET_NAME);
+
+  return workbook;
 }
 
 function sanitizeExportFileName(value) {
@@ -698,8 +1111,171 @@ function sanitizeExportFileName(value) {
   return normalized || "Budget_2025 Final";
 }
 
+function canUseSourceLinkPicker() {
+  return Boolean((canUseBrowserSourcePicker() || canUseAndroidSourcePicker()) && state.sourceSafety.allowDirectWrite);
+}
+
+function hasLinkedWritableSource() {
+  return Boolean(
+    (state.sourceLink?.kind === "file-handle" && state.sourceLink?.handle) ||
+      (state.sourceLink?.kind === "android-document" && state.sourceLink?.uri)
+  );
+}
+
+function canSaveToSource() {
+  return Boolean(state.mode === "budget" && state.workbook && state.sourceSafety.allowDirectWrite && hasLinkedWritableSource());
+}
+
+async function saveWorkbookToLinkedSource(workbook, sourceLink) {
+  if (!sourceLink) {
+    throw new Error("Aucune source liee");
+  }
+
+  if (sourceLink.kind === "android-document") {
+    await saveWorkbookToAndroidSource(workbook, sourceLink);
+    return;
+  }
+
+  if (!sourceLink.handle) {
+    throw new Error("Aucune source liee");
+  }
+
+  const hasPermission = await ensureSourceWritePermission(sourceLink.handle);
+  if (!hasPermission) {
+    throw new Error("Permission d'ecriture refusee");
+  }
+
+  const writable = await sourceLink.handle.createWritable();
+
+  try {
+    await writable.write(
+      XLSX.write(workbook, {
+        bookType: getWorkbookBookType(sourceLink.handle.name || state.workbookName),
+        type: "array",
+      })
+    );
+  } finally {
+    await writable.close();
+  }
+}
+
+async function saveWorkbookToAndroidSource(workbook, sourceLink) {
+  const BudgetSource = getBudgetSourcePlugin();
+  if (!BudgetSource?.saveSource) {
+    throw new Error("Plugin source Android indisponible");
+  }
+
+  await BudgetSource.saveSource({
+    uri: sourceLink.uri,
+    data: XLSX.write(workbook, {
+      bookType: getWorkbookBookType(sourceLink.name || state.workbookName),
+      type: "base64",
+    }),
+    fileName: sourceLink.name || state.workbookName,
+  });
+}
+
+async function ensureSourceWritePermission(fileHandle) {
+  const permissionOptions = { mode: "readwrite" };
+
+  if (typeof fileHandle.queryPermission === "function") {
+    const currentPermission = await fileHandle.queryPermission(permissionOptions);
+    if (currentPermission === "granted") {
+      return true;
+    }
+  }
+
+  if (typeof fileHandle.requestPermission === "function") {
+    const requestedPermission = await fileHandle.requestPermission(permissionOptions);
+    return requestedPermission === "granted";
+  }
+
+  return true;
+}
+
+function getWorkbookBookType(fileName) {
+  const normalized = String(fileName || "").toLowerCase();
+
+  if (normalized.endsWith(".xls")) {
+    return "biff8";
+  }
+
+  return "xlsx";
+}
+
+function buildSourceLinkUnavailableMessage() {
+  if (state.mode === "budget" && !state.sourceSafety.allowDirectWrite) {
+    return state.sourceSafety.reason;
+  }
+
+  if (hasLinkedWritableSource()) {
+    return "La source est deja liee";
+  }
+
+  if (canUseAndroidSourcePicker()) {
+    return "Sur Android, utilisez Lier la source pour autoriser l'ecriture directe";
+  }
+
+  if (location.protocol === "file:") {
+    return "Mode local: publiez l'app en HTTPS puis utilisez Lier la source pour ecrire dans le fichier d'origine";
+  }
+
+  if (!canUseSourceLinkPicker()) {
+    return "Votre navigateur ne permet pas encore de lier directement le fichier source";
+  }
+
+  return "Liez d'abord la source avec le bouton dedie";
+}
+
+function buildSourceSaveErrorMessage(error) {
+  const rawMessage = String(error?.message || "").toLowerCase();
+
+  if (error?.name === "NotAllowedError" || rawMessage.includes("permission")) {
+    return "Ecriture refusee sur le fichier source";
+  }
+
+  if (rawMessage.includes("stream") || rawMessage.includes("document")) {
+    return "Le document source n'a pas accepte la reecriture directe";
+  }
+
+  return "L'enregistrement direct dans la source a echoue";
+}
+
 function getCapacitorRuntime() {
   return window.Capacitor || null;
+}
+
+function getCapacitorPlatformName() {
+  return String(getCapacitorRuntime()?.getPlatform?.() || "");
+}
+
+function isAndroidNativeRuntime() {
+  return isNativeAppRuntime() && getCapacitorPlatformName() === "android";
+}
+
+function getBudgetSourcePlugin() {
+  if (budgetSourcePlugin) {
+    return budgetSourcePlugin;
+  }
+
+  const Capacitor = getCapacitorRuntime();
+  if (!Capacitor) {
+    return null;
+  }
+
+  budgetSourcePlugin = typeof Capacitor.registerPlugin === "function"
+    ? Capacitor.registerPlugin("BudgetSource")
+    : Capacitor.Plugins?.BudgetSource || null;
+
+  return budgetSourcePlugin;
+}
+
+function canUseBrowserSourcePicker() {
+  return Boolean(window.isSecureContext && typeof window.showOpenFilePicker === "function");
+}
+
+function canUseAndroidSourcePicker() {
+  return Boolean(isAndroidNativeRuntime() && getBudgetSourcePlugin());
 }
 
 function getFilesystemPlugin() {
@@ -716,6 +1292,17 @@ function getSharePlugin() {
 
 function isNativeAppRuntime() {
   return Boolean(getCapacitorRuntime()?.isNativePlatform?.());
+}
+
+function base64ToArrayBuffer(base64Value) {
+  const binary = window.atob(String(base64Value || ""));
+  const bytes = new Uint8Array(binary.length);
+
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+
+  return bytes.buffer;
 }
 
 function canUseNativeExcelExport() {
@@ -828,6 +1415,7 @@ function renderAll() {
   renderCards();
   renderEditor();
   renderControls();
+  renderDraftStatus();
   renderAppShellState();
 }
 
@@ -864,7 +1452,7 @@ function renderSheetOptions() {
     return;
   }
 
-  [JOURNAL_SHEET_NAME, RECAP_SHEET_NAME].forEach((viewName) => {
+  [JOURNAL_SHEET_NAME, RECAP_SHEET_NAME, ANALYSIS_VIEW_NAME].forEach((viewName) => {
     const option = document.createElement("option");
     option.value = viewName;
     option.textContent = viewName;
@@ -903,6 +1491,14 @@ function renderSectionHeading() {
     return;
   }
 
+  if (state.activeView === ANALYSIS_VIEW_NAME) {
+    refs.cardsKicker.textContent = "Comparaisons";
+    refs.cardsTitle.textContent = "Income, expenses et savings en perspective";
+    refs.cardsCaption.textContent =
+      "Cette vue ajoute des comparaisons et des graphiques pertinents a partir de Journalier pour suivre l'equilibre entre income, expenses, savings et cash.";
+    return;
+  }
+
   refs.cardsKicker.textContent = "Journalier";
   refs.cardsTitle.textContent = "Les ecritures deviennent des fiches";
   refs.cardsCaption.textContent =
@@ -913,6 +1509,9 @@ function renderControls() {
   const hasBudget = state.mode === "budget";
   const journalActive = hasBudget && state.activeView === JOURNAL_SHEET_NAME;
   const recapActive = hasBudget && state.activeView === RECAP_SHEET_NAME;
+  const analysisActive = hasBudget && state.activeView === ANALYSIS_VIEW_NAME;
+  const draft = readStoredDraft();
+  const hasStoredDraft = Boolean(draft && draft.mode === "budget" && Array.isArray(draft.rows));
   const availableYears = getAvailableRecapYears();
   const availableMonths = getAvailableRecapMonths(state.recapFilters.year);
 
@@ -920,15 +1519,62 @@ function renderControls() {
   refs.searchInput.disabled = !hasBudget;
   refs.searchInput.placeholder = recapActive
     ? "Chercher un poste ou une categorie du recap..."
-    : "Categorie, date, valeur...";
+    : analysisActive
+      ? "Periode, indicateur, valeur..."
+      : "Categorie, date, valeur...";
+  refs.openSourceButton.disabled = !window.XLSX || !canUseSourceLinkPicker();
+  refs.openSourceButton.textContent = state.mode === "budget" && !state.sourceSafety.allowDirectWrite ? "Source protegee" : hasLinkedWritableSource() ? "Relier la source" : "Lier la source";
+  refs.openSourceButton.title = state.mode === "budget" && !state.sourceSafety.allowDirectWrite
+    ? state.sourceSafety.reason
+    : canUseSourceLinkPicker()
+      ? "Ouvre le classeur avec autorisation d'ecriture directe"
+      : buildSourceLinkUnavailableMessage();
+  refs.saveSourceButton.disabled = !canSaveToSource();
+  refs.saveSourceButton.textContent = state.mode === "budget" && !state.sourceSafety.allowDirectWrite ? "Source preservee" : "Enregistrer la source";
+  refs.saveSourceButton.title = canSaveToSource()
+    ? "Ecrit les changements dans le fichier d'origine sans passer par une copie exportee"
+    : buildSourceLinkUnavailableMessage();
+  refs.saveDraftButton.disabled = !hasBudget;
+  refs.saveDraftButton.title = hasBudget
+    ? "Memorise vos donnees actuelles dans le navigateur pour reprendre plus tard"
+    : "Chargez ou restaurez un budget avant d'enregistrer un brouillon local";
+  refs.restoreDraftButton.disabled = !hasStoredDraft;
+  refs.restoreDraftButton.title = hasStoredDraft
+    ? "Recharge le dernier brouillon local memorise dans l'app"
+    : "Aucun brouillon local disponible pour le moment";
   refs.recapYearField.classList.toggle("hidden", !hasBudget);
   refs.recapMonthField.classList.toggle("hidden", !hasBudget);
   refs.recapYearSelect.disabled = !hasBudget || !availableYears.length;
   refs.recapMonthSelect.disabled = !hasBudget || !availableMonths.length;
   refs.addButton.disabled = !journalActive;
-  refs.exportButton.disabled = !hasBudget || !state.workbook || !window.XLSX;
+  refs.exportButton.disabled = !hasBudget || !window.XLSX;
   refs.saveButton.disabled = !journalActive;
   refs.cancelButton.disabled = !journalActive;
+}
+
+function renderDraftStatus() {
+  const draft = readStoredDraft();
+  const hasStoredDraft = Boolean(draft && draft.mode === "budget" && Array.isArray(draft.rows));
+
+  if (!hasStoredDraft) {
+    refs.draftStatus.textContent = "Aucun brouillon local memorise.";
+    return;
+  }
+
+  const savedAtLabel = formatDraftSavedAt(draft.savedAt);
+  const suffix = savedAtLabel ? ` Derniere sauvegarde ${savedAtLabel}.` : "";
+
+  if (state.mode === "budget" && !state.workbook) {
+    refs.draftStatus.textContent = `Mode autonome local actif.${suffix}`;
+    return;
+  }
+
+  if (state.mode === "budget") {
+    refs.draftStatus.textContent = `Brouillon local pret en secours.${suffix}`;
+    return;
+  }
+
+  refs.draftStatus.textContent = `Brouillon local disponible.${suffix} Cliquez sur Restaurer pour reprendre vos donnees.`;
 }
 
 function renderStats() {
@@ -940,8 +1586,8 @@ function renderStats() {
     refs.activeSheet.textContent = "Aucune";
     refs.lastAction.textContent = state.lastAction;
     refs.metricMode.textContent = "Pret pour l'import";
-    refs.metricFile.textContent = state.workbookName || "Aucun fichier";
-    refs.metricSave.textContent = "Chargez le fichier";
+    refs.metricFile.textContent = buildWorkbookLabel();
+    refs.metricSave.textContent = canUseSourceLinkPicker() ? "Chargez ou liez la source" : "Chargez le fichier";
     return;
   }
 
@@ -954,10 +1600,22 @@ function renderStats() {
     refs.activeSheet.textContent = RECAP_SHEET_NAME;
     refs.lastAction.textContent = state.lastAction;
     refs.metricMode.textContent = `Vue recap - ${recapView.periodLabel}`;
-    refs.metricFile.textContent = state.workbookName || "Aucun fichier";
-    refs.metricSave.textContent = state.workbook
-      ? getExportCapabilityLabel()
-      : "Rechargez le fichier pour exporter";
+    refs.metricFile.textContent = buildWorkbookLabel();
+    refs.metricSave.textContent = getSaveCapabilityLabel();
+    return;
+  }
+
+  if (state.activeView === ANALYSIS_VIEW_NAME) {
+    const analysisView = buildLiveAnalysisView();
+    refs.recordsLabel.textContent = "Periodes";
+    refs.recordsCount.textContent = String(analysisView.seriesRows.length);
+    refs.columnsLabel.textContent = "Graphiques";
+    refs.columnsCount.textContent = String(analysisView.chartCount);
+    refs.activeSheet.textContent = ANALYSIS_VIEW_NAME;
+    refs.lastAction.textContent = state.lastAction;
+    refs.metricMode.textContent = `Vue analyse - ${analysisView.periodLabel}`;
+    refs.metricFile.textContent = buildWorkbookLabel();
+    refs.metricSave.textContent = getSaveCapabilityLabel();
     return;
   }
 
@@ -971,14 +1629,48 @@ function renderStats() {
   refs.metricMode.textContent = hasActiveRecapPeriodFilter()
     ? `Journalier card view - ${buildRecapPeriodLabel()}`
     : "Journalier card view";
-  refs.metricFile.textContent = state.workbookName || "Aucun fichier";
-  refs.metricSave.textContent = state.workbook
-    ? getExportCapabilityLabel()
-    : "Rechargez le fichier pour exporter";
+  refs.metricFile.textContent = buildWorkbookLabel();
+  refs.metricSave.textContent = getSaveCapabilityLabel();
 }
 
 function getExportCapabilityLabel() {
   return canUseNativeExcelExport() ? "Partage natif Excel" : "Export vers le classeur";
+}
+
+function getSaveCapabilityLabel() {
+  if (canSaveToSource()) {
+    return "Source liee - auto-save actif";
+  }
+
+  if (state.mode === "budget" && !state.workbook) {
+    return "Mode autonome - export copie locale";
+  }
+
+  if (state.mode === "budget" && !state.sourceSafety.allowDirectWrite) {
+    return "Source preservee - export copie uniquement";
+  }
+
+  if (canUseBrowserSourcePicker() || canUseAndroidSourcePicker()) {
+    return "Export ou liaison source";
+  }
+
+  return getExportCapabilityLabel();
+}
+
+function buildWorkbookLabel() {
+  if (!state.workbookName) {
+    return state.mode === "budget" ? "Donnees locales" : "Aucun fichier";
+  }
+
+  if (state.mode === "budget" && !state.workbook) {
+    return `${state.workbookName} - donnees locales`;
+  }
+
+  if (state.mode === "budget" && !state.sourceSafety.allowDirectWrite) {
+    return `${state.workbookName} - source protegee`;
+  }
+
+  return hasLinkedWritableSource() ? `${state.workbookName} - source liee` : state.workbookName;
 }
 
 function getFilteredJournalRows() {
@@ -1022,6 +1714,11 @@ function renderCards() {
 
   if (state.activeView === RECAP_SHEET_NAME) {
     renderRecapView();
+    return;
+  }
+
+  if (state.activeView === ANALYSIS_VIEW_NAME) {
+    renderAnalysisView();
     return;
   }
 
@@ -1094,13 +1791,33 @@ function renderRecapView() {
     refs.recapView.classList.add("hidden");
     refs.cardsEmpty.innerHTML = [
       "<strong>La vue Recapitulatif n'est pas disponible.</strong>",
-      "<p>Rechargez Budget_2025 Final.xlsx pour reconstruire la synthese.</p>",
+      "<p>Importez une premiere fois votre budget ou restaurez vos donnees locales pour reconstruire la synthese.</p>",
     ].join("");
     return;
   }
 
   refs.cardsEmpty.classList.add("hidden");
   refs.recapView.innerHTML = createRecapMarkup(recapView);
+}
+
+function renderAnalysisView() {
+  refs.cardsGrid.classList.add("hidden");
+  refs.recapView.classList.remove("hidden");
+
+  const analysisView = buildLiveAnalysisView();
+
+  if (!analysisView.available) {
+    refs.cardsEmpty.classList.remove("hidden");
+    refs.recapView.classList.add("hidden");
+    refs.cardsEmpty.innerHTML = [
+      "<strong>La vue Comparaisons n'est pas disponible.</strong>",
+      "<p>Importez une premiere fois votre budget ou restaurez vos donnees locales pour construire les graphiques et comparaisons.</p>",
+    ].join("");
+    return;
+  }
+
+  refs.cardsEmpty.classList.add("hidden");
+  refs.recapView.innerHTML = createAnalysisMarkup(analysisView);
 }
 
 function buildJournalEmptyStateMarkup() {
@@ -1164,6 +1881,41 @@ function buildLiveRecapView() {
     availabilityScopeLabel: buildRecapAvailabilityScopeLabel(),
     periodLabel: buildRecapPeriodLabel(),
     filteredUndatedCount: filtersActive ? countUndatedBudgetRows() : 0,
+  };
+}
+
+function buildLiveAnalysisView() {
+  if (state.mode !== "budget") {
+    return {
+      available: false,
+      periodLabel: "Toutes les donnees",
+      chartCount: 0,
+      metricCards: [],
+      comparisonRows: [],
+      seriesRows: [],
+      snapshotDate: "",
+      transactionCount: 0,
+      trendTitle: "",
+      trendSubtitle: "",
+    };
+  }
+
+  const filteredRows = getFilteredRecapSourceRows();
+  const snapshot = computeMetricSnapshot(buildActualAmountMap(filteredRows));
+  const allSeriesRows = buildAnalysisSeriesRows();
+  const seriesRows = filterAnalysisSeriesRows(allSeriesRows);
+
+  return {
+    available: true,
+    periodLabel: buildRecapPeriodLabel(),
+    chartCount: 2,
+    metricCards: buildAnalysisMetricCards(snapshot),
+    comparisonRows: buildAnalysisComparisonRows(snapshot),
+    seriesRows,
+    snapshotDate: state.recap.snapshotDate,
+    transactionCount: filteredRows.length,
+    trendTitle: buildAnalysisTrendTitle(),
+    trendSubtitle: buildAnalysisTrendSubtitle(allSeriesRows.length, seriesRows.length),
   };
 }
 
@@ -1316,20 +2068,269 @@ function buildActualAmountMap(rows) {
   return amounts;
 }
 
-function buildRecapMetrics(actualMap) {
+function computeMetricSnapshot(actualMap) {
   const income = Math.abs(getActualAmount(actualMap, "Income"));
   const savings = Math.abs(getActualAmount(actualMap, "Savings"));
   const seasonalSavings = Math.abs(getActualAmount(actualMap, "Savings for seasonal exp."));
+  const totalSavings = savings + seasonalSavings;
   const totalExpenses = computeTotalExpenses(actualMap);
-  const cash = income - savings - totalExpenses;
+  const cash = income - totalSavings - totalExpenses;
+
+  return {
+    income,
+    expenses: totalExpenses,
+    savings,
+    seasonalSavings,
+    totalSavings,
+    cash,
+  };
+}
+
+function buildRecapMetrics(actualMap) {
+  const snapshot = computeMetricSnapshot(actualMap);
 
   return [
-    { label: "Income", value: income, tone: "positive" },
-    { label: "Expenses", value: totalExpenses, tone: "negative" },
-    { label: "Savings", value: savings, tone: "neutral" },
-    { label: "Cash", value: cash, tone: cash >= 0 ? "positive" : "negative" },
-    { label: "Seasonal Savings", value: seasonalSavings, tone: "neutral" },
+    { label: "Income", value: snapshot.income, tone: "positive" },
+    { label: "Expenses", value: snapshot.expenses, tone: "negative" },
+    { label: "Savings", value: snapshot.savings, tone: "neutral" },
+    { label: "Cash", value: snapshot.cash, tone: snapshot.cash >= 0 ? "positive" : "negative" },
+    { label: "Seasonal Savings", value: snapshot.seasonalSavings, tone: "neutral" },
   ];
+}
+
+function buildAnalysisMetricCards(snapshot) {
+  return [
+    { label: "Income", value: snapshot.income, tone: "positive" },
+    { label: "Expenses", value: snapshot.expenses, tone: "negative" },
+    { label: "Savings", value: snapshot.totalSavings, tone: "neutral" },
+    { label: "Cash", value: snapshot.cash, tone: snapshot.cash >= 0 ? "positive" : "negative" },
+  ];
+}
+
+function buildAnalysisComparisonRows(snapshot) {
+  const rows = [
+    {
+      label: "Income",
+      value: snapshot.income,
+      displayValue: formatCurrency(snapshot.income),
+      tone: "positive",
+      caption: "Volume des revenus retenus pour la periode filtree.",
+    },
+    {
+      label: "Expenses",
+      value: snapshot.expenses,
+      displayValue: formatCurrency(snapshot.expenses),
+      tone: "negative",
+      caption: "Somme des depenses hors postes de savings.",
+    },
+    {
+      label: "Savings",
+      value: snapshot.totalSavings,
+      displayValue: formatCurrency(snapshot.totalSavings),
+      tone: "neutral",
+      caption: "Savings total incluant les seasonal savings.",
+    },
+    {
+      label: "Cash",
+      value: Math.abs(snapshot.cash),
+      displayValue: formatSignedCurrency(snapshot.cash),
+      tone: snapshot.cash >= 0 ? "positive" : "negative",
+      caption: "Disponible net apres expenses et savings.",
+    },
+  ];
+
+  const maxValue = Math.max(...rows.map((row) => row.value), 1);
+
+  return rows.map((row) => ({
+    ...row,
+    percentage: buildChartScale(row.value, maxValue, 14),
+  }));
+}
+
+function buildAnalysisSeriesRows() {
+  const mode = getAnalysisSeriesMode();
+  const buckets = new Map();
+
+  state.budget.rows.forEach((row) => {
+    const dateParts = getBudgetRowDateParts(row);
+    if (!dateParts) {
+      return;
+    }
+
+    const bucket = getAnalysisBucketForDate(dateParts, mode);
+    if (!bucket) {
+      return;
+    }
+
+    if (!buckets.has(bucket.key)) {
+      buckets.set(bucket.key, {
+        ...bucket,
+        rows: [],
+      });
+    }
+
+    buckets.get(bucket.key).rows.push(row);
+  });
+
+  let seriesRows = Array.from(buckets.values())
+    .sort((left, right) => String(left.sortKey).localeCompare(String(right.sortKey)));
+
+  if (mode === "recent_months") {
+    seriesRows = seriesRows.slice(-8);
+  }
+
+  if (mode === "selected_period_window") {
+    const selectedKey = buildYearMonthKey(state.recapFilters.year, state.recapFilters.month);
+    const selectedIndex = seriesRows.findIndex((row) => row.key === selectedKey);
+    seriesRows = selectedIndex >= 0
+      ? seriesRows.slice(Math.max(0, selectedIndex - 5), selectedIndex + 1)
+      : seriesRows.slice(-6);
+  }
+
+  return seriesRows.map((row) => {
+    const snapshot = computeMetricSnapshot(buildActualAmountMap(row.rows));
+
+    return {
+      key: row.key,
+      label: row.label,
+      shortLabel: row.shortLabel,
+      income: snapshot.income,
+      expenses: snapshot.expenses,
+      savings: snapshot.totalSavings,
+      cash: snapshot.cash,
+    };
+  });
+}
+
+function getAnalysisSeriesMode() {
+  if (state.recapFilters.year !== "all" && state.recapFilters.month === "all") {
+    return "year_months";
+  }
+
+  if (state.recapFilters.year === "all" && state.recapFilters.month !== "all") {
+    return "month_across_years";
+  }
+
+  if (state.recapFilters.year !== "all" && state.recapFilters.month !== "all") {
+    return "selected_period_window";
+  }
+
+  return "recent_months";
+}
+
+function getAnalysisBucketForDate(dateParts, mode) {
+  if (mode === "year_months") {
+    if (dateParts.year !== state.recapFilters.year) {
+      return null;
+    }
+
+    return {
+      key: dateParts.month,
+      sortKey: buildYearMonthKey(dateParts.year, dateParts.month),
+      label: formatMonthLabel(dateParts.month),
+      shortLabel: formatMonthShortLabel(dateParts.year, dateParts.month, false),
+    };
+  }
+
+  if (mode === "month_across_years") {
+    if (dateParts.month !== state.recapFilters.month) {
+      return null;
+    }
+
+    return {
+      key: dateParts.year,
+      sortKey: dateParts.year,
+      label: dateParts.year,
+      shortLabel: dateParts.year,
+    };
+  }
+
+  return {
+    key: buildYearMonthKey(dateParts.year, dateParts.month),
+    sortKey: buildYearMonthKey(dateParts.year, dateParts.month),
+    label: formatMonthShortLabel(dateParts.year, dateParts.month, true),
+    shortLabel: formatMonthShortLabel(dateParts.year, dateParts.month, false),
+  };
+}
+
+function filterAnalysisSeriesRows(rows) {
+  if (!state.search) {
+    return rows;
+  }
+
+  return rows.filter((row) => matchesAnalysisSearch(row, state.search));
+}
+
+function matchesAnalysisSearch(row, query) {
+  const haystack = [
+    row.label,
+    row.shortLabel,
+    formatCurrency(row.income),
+    formatCurrency(row.expenses),
+    formatCurrency(row.savings),
+    formatSignedCurrency(row.cash),
+  ].join(" ").toLowerCase();
+
+  return haystack.includes(query);
+}
+
+function buildAnalysisTrendTitle() {
+  const mode = getAnalysisSeriesMode();
+
+  if (mode === "year_months") {
+    return `Lecture mensuelle de ${state.recapFilters.year}`;
+  }
+
+  if (mode === "month_across_years") {
+    return `Comparaison annuelle pour ${formatMonthLabel(state.recapFilters.month)}`;
+  }
+
+  if (mode === "selected_period_window") {
+    return `Fenetre autour de ${buildRecapPeriodLabel()}`;
+  }
+
+  return "Dernieres periodes disponibles";
+}
+
+function buildAnalysisTrendSubtitle(totalCount, visibleCount) {
+  const mode = getAnalysisSeriesMode();
+  let baseSubtitle = "Income, expenses et savings total sont compares periode par periode.";
+
+  if (mode === "year_months") {
+    baseSubtitle = "Chaque groupe compare les mois de l'annee filtree.";
+  } else if (mode === "month_across_years") {
+    baseSubtitle = "Le meme mois est compare d'une annee a l'autre.";
+  } else if (mode === "selected_period_window") {
+    baseSubtitle = "La selection montre la periode demandee et les periodes precedentes les plus proches.";
+  }
+
+  if (state.search && totalCount !== visibleCount) {
+    return `${baseSubtitle} Recherche active: ${visibleCount} periode(s) visibles sur ${totalCount}.`;
+  }
+
+  return baseSubtitle;
+}
+
+function buildYearMonthKey(year, month) {
+  return `${year}-${month}`;
+}
+
+function formatMonthShortLabel(year, month, includeYear) {
+  const label = new Intl.DateTimeFormat("fr-CA", {
+    month: "short",
+    ...(includeYear ? { year: "numeric" } : {}),
+    timeZone: "UTC",
+  }).format(new Date(Date.UTC(Number(year), Number(month) - 1, 1, 12)));
+
+  return label.charAt(0).toUpperCase() + label.slice(1);
+}
+
+function buildChartScale(value, maxValue, minimumPercent = 10) {
+  if (!Number.isFinite(value) || value <= 0 || !Number.isFinite(maxValue) || maxValue <= 0) {
+    return 0;
+  }
+
+  return Math.max(minimumPercent, (value / maxValue) * 100);
 }
 
 function buildRecapDetailRows(actualMap) {
@@ -1524,6 +2525,111 @@ function createRecapMarkup(recapView) {
   `;
 }
 
+function createAnalysisMarkup(analysisView) {
+  const comparisonMaxValue = Math.max(
+    ...analysisView.comparisonRows.map((row) => row.value),
+    1
+  );
+  const trendMaxValue = Math.max(
+    ...analysisView.seriesRows.flatMap((row) => [row.income, row.expenses, row.savings]),
+    1
+  );
+  const transactionLabel = `${analysisView.transactionCount} transaction${analysisView.transactionCount > 1 ? "s" : ""} retenue${analysisView.transactionCount > 1 ? "s" : ""}.`;
+
+  return `
+    <div class="analysis-shell">
+      <div class="recap-metrics">
+        ${analysisView.metricCards.map((metric) => createRecapMetricMarkup(metric)).join("")}
+      </div>
+      <div class="recap-note">
+        <strong>Source:</strong> vue analytique construite depuis <code>${JOURNAL_SHEET_NAME}</code>.
+        ${analysisView.snapshotDate ? ` Snapshot date: ${escapeHtml(analysisView.snapshotDate)}.` : ""}
+        <br><strong>Periode analysee:</strong> ${escapeHtml(analysisView.periodLabel)}. ${escapeHtml(transactionLabel)}
+        <br><strong>Lecture:</strong> les graphiques comparent Income, Expenses et Savings. Savings inclut aussi les seasonal savings.
+      </div>
+
+      <section class="recap-section">
+        <div class="recap-section-head">
+          <h3>Comparaison des indicateurs</h3>
+          <p>Lecture rapide des masses budgetaires sur la periode filtree.</p>
+        </div>
+        <div class="analysis-bar-list">
+          ${analysisView.comparisonRows.map((row) => createAnalysisMetricBarMarkup(row, comparisonMaxValue)).join("")}
+        </div>
+      </section>
+
+      <section class="recap-section">
+        <div class="recap-section-head">
+          <h3>${escapeHtml(analysisView.trendTitle)}</h3>
+          <p>${escapeHtml(analysisView.trendSubtitle)}</p>
+        </div>
+        ${analysisView.seriesRows.length ? `
+          <div class="analysis-period-chart">
+            ${analysisView.seriesRows.map((row) => createAnalysisPeriodGroupMarkup(row, trendMaxValue)).join("")}
+          </div>
+          <div class="analysis-legend">
+            <span class="analysis-legend-item"><span class="analysis-legend-swatch income"></span>Income</span>
+            <span class="analysis-legend-item"><span class="analysis-legend-swatch expenses"></span>Expenses</span>
+            <span class="analysis-legend-item"><span class="analysis-legend-swatch savings"></span>Savings</span>
+          </div>
+        ` : `
+          <div class="empty-form">
+            Aucun groupe de comparaison ne correspond a la recherche ou au filtre actif.
+          </div>
+        `}
+      </section>
+
+      ${createRecapTableMarkup(
+        "Tableau de comparaison",
+        "Resume periode par periode pour comparer Income, Expenses, Savings et Cash.",
+        ["Periode", "Income", "Expenses", "Savings", "Cash"],
+        analysisView.seriesRows.map((row) => ({
+          cells: [
+            { value: row.label, numeric: false },
+            { value: formatCurrency(row.income), numeric: true },
+            { value: formatCurrency(row.expenses), numeric: true },
+            { value: formatCurrency(row.savings), numeric: true },
+            { value: formatSignedCurrency(row.cash), numeric: true },
+          ],
+          total: false,
+        }))
+      )}
+    </div>
+  `;
+}
+
+function createAnalysisMetricBarMarkup(row, maxValue) {
+  return `
+    <article class="analysis-bar-card analysis-bar-card-${row.tone}">
+      <div class="analysis-bar-head">
+        <span>${escapeHtml(row.label)}</span>
+        <strong>${escapeHtml(row.displayValue)}</strong>
+      </div>
+      <div class="analysis-bar-track">
+        <span
+          class="analysis-bar-fill analysis-bar-fill-${row.tone}"
+          style="width: ${buildChartScale(row.value, maxValue, 14)}%;"
+        ></span>
+      </div>
+      <p class="analysis-bar-caption">${escapeHtml(row.caption)}</p>
+    </article>
+  `;
+}
+
+function createAnalysisPeriodGroupMarkup(row, maxValue) {
+  return `
+    <article class="analysis-period-group">
+      <div class="analysis-period-bars">
+        <span class="analysis-mini-bar income" style="height: ${buildChartScale(row.income, maxValue, 10)}%;"></span>
+        <span class="analysis-mini-bar expenses" style="height: ${buildChartScale(row.expenses, maxValue, 10)}%;"></span>
+        <span class="analysis-mini-bar savings" style="height: ${buildChartScale(row.savings, maxValue, 10)}%;"></span>
+      </div>
+      <strong class="analysis-period-label">${escapeHtml(row.shortLabel)}</strong>
+      <span class="analysis-period-meta">${escapeHtml(formatSignedCurrency(row.cash))}</span>
+    </article>
+  `;
+}
+
 function createRecapMetricMarkup(metric) {
   return `
     <article class="recap-metric recap-metric-${metric.tone}">
@@ -1580,19 +2686,31 @@ function renderEditor() {
     return;
   }
 
-  if (state.activeView === RECAP_SHEET_NAME) {
-    refs.formTitle.textContent = "Vue recap";
+  if (state.activeView !== JOURNAL_SHEET_NAME) {
+    const isRecapView = state.activeView === RECAP_SHEET_NAME;
+    refs.formTitle.textContent = isRecapView ? "Vue recap" : "Vue comparaisons";
     refs.formSubtitle.textContent = "Lecture seule dans l'app.";
-    refs.formFields.innerHTML = `
-      <div class="empty-form">
-        Cette vue n'edite pas directement la feuille Recapitulatif d'Excel.
-        Elle reconstruit une synthese lisible a partir de ${RECAP_SHEET_NAME}, ${TCD_SHEET_NAME}
-        et de vos transactions ${JOURNAL_SHEET_NAME}. Pour modifier les donnees, revenez sur
-        la vue Journalier.
-      </div>
-    `;
+    refs.formFields.innerHTML = isRecapView
+      ? `
+        <div class="empty-form">
+          Cette vue n'edite pas directement la feuille Recapitulatif d'Excel.
+          Elle reconstruit une synthese lisible a partir de ${RECAP_SHEET_NAME}, ${TCD_SHEET_NAME}
+          et de vos transactions ${JOURNAL_SHEET_NAME}. Pour modifier les donnees, revenez sur
+          la vue Journalier.
+        </div>
+      `
+      : `
+        <div class="empty-form">
+          Cette vue ajoute des comparaisons et des graphiques a partir des ecritures de ${JOURNAL_SHEET_NAME}.
+          Elle est destinee a l'analyse. Pour modifier les donnees, revenez sur la vue Journalier.
+        </div>
+      `;
     return;
   }
+
+  refs.formSubtitle.textContent = state.workbook
+    ? "Ajoutez ou modifiez vos transactions. Les vues de recap et de comparaison se recalculent aussitot."
+    : "Mode autonome local. Ajoutez ou modifiez vos transactions, les graphiques se mettent a jour aussitot et l'export reste disponible.";
 
   const editingRow =
     state.editorMode === "edit" &&
@@ -1607,7 +2725,9 @@ function renderEditor() {
   }
 
   refs.formTitle.textContent = state.editorMode === "edit" ? "Modifier la transaction" : "Nouvelle transaction";
-  refs.formSubtitle.textContent = "Saisie directe de Journalier!D:F avec categories predefinies depuis la colonne B.";
+  refs.formSubtitle.textContent = state.workbook
+    ? "Saisie directe de Journalier!D:F avec categories predefinies depuis la colonne B."
+    : "Mode autonome local: vos categories, recapitulatifs et graphiques se mettent a jour a chaque enregistrement.";
   refs.formFields.innerHTML = "";
 
   appendField(renderDateField(editingRow.Date));
@@ -1841,6 +2961,22 @@ function formatDateForDisplay(value) {
 
   const parsed = new Date(`${iso}T00:00:00`);
   return new Intl.DateTimeFormat("fr-CA", { dateStyle: "medium" }).format(parsed);
+}
+
+function formatDraftSavedAt(value) {
+  if (!value) {
+    return "";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "";
+  }
+
+  return new Intl.DateTimeFormat("fr-CA", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(parsed);
 }
 
 function formatCurrency(value) {

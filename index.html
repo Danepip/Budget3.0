@@ -46,7 +46,7 @@
           <strong id="metric-file">Aucun fichier</strong>
         </div>
         <div class="hero-metric">
-          <span class="metric-label">Export</span>
+          <span class="metric-label">Sauvegarde</span>
           <strong id="metric-save">Chargez le fichier</strong>
         </div>
 
@@ -95,9 +95,18 @@
           </label>
         </div>
 
-        <div class="toolbar-actions">
-          <button id="add-record" class="button secondary" type="button" disabled>Nouvelle fiche</button>
-          <button id="export-workbook" class="button primary" type="button" disabled>Exporter Excel</button>
+        <div class="toolbar-side">
+          <div class="toolbar-actions">
+            <button id="open-source" class="button ghost" type="button" disabled>Lier la source</button>
+            <button id="save-source" class="button secondary" type="button" disabled>Enregistrer la source</button>
+            <button id="save-draft" class="button ghost" type="button" disabled>Sauvegarde locale</button>
+            <button id="restore-draft" class="button ghost" type="button" disabled>Restaurer</button>
+            <button id="add-record" class="button secondary" type="button" disabled>Nouvelle fiche</button>
+            <button id="export-workbook" class="button primary" type="button" disabled>Exporter Excel</button>
+          </div>
+          <p id="draft-status" class="draft-status">
+            Aucun brouillon local memorise.
+          </p>
         </div>
       </section>
 
