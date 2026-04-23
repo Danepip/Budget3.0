@@ -17,6 +17,7 @@ const state = {
   workbook: null,
   sourceLink: null,
   sourceSafety: createEmptySourceSafety(),
+  cloud: createEmptyCloudState(),
   draftSavedAt: "",
   mode: "idle",
   activeView: JOURNAL_SHEET_NAME,
@@ -34,6 +35,11 @@ let deferredInstallPrompt = null;
 let appShellReady = false;
 let sourceSaveQueue = Promise.resolve();
 let budgetSourcePlugin = null;
+let supabaseClient = null;
+let supabaseAuthSubscription = null;
+let supabaseRealtimeChannel = null;
+let cloudRefreshTimer = null;
+let cloudSyncQueue = Promise.resolve();
 
 document.addEventListener("DOMContentLoaded", () => {
   cacheDom();
@@ -41,6 +47,7 @@ document.addEventListener("DOMContentLoaded", () => {
   restoreDraft();
   syncLibraryState();
   setupAppShell();
+  void initSupabaseIntegration();
   renderAll();
 });
 
@@ -68,6 +75,25 @@ function createEmptyRecapFilters() {
   };
 }
 
+function createEmptyCloudState() {
+  return {
+    configured: false,
+    ready: false,
+    syncBusy: false,
+    email: "",
+    status: "Supabase non configure.",
+    session: null,
+    user: null,
+    space: {
+      id: "",
+      name: "",
+      joinCode: "",
+    },
+    lastPulledAt: "",
+    lastPushedAt: "",
+  };
+}
+
 function createEmptySourceSafety() {
   return {
     allowDirectWrite: false,
@@ -92,6 +118,16 @@ function cacheDom() {
   refs.recapMonthField = document.getElementById("recap-month-field");
   refs.recapMonthSelect = document.getElementById("recap-month-select");
   refs.searchInput = document.getElementById("search-input");
+  refs.cloudStatus = document.getElementById("cloud-status");
+  refs.cloudEmailInput = document.getElementById("cloud-email");
+  refs.cloudCodeInput = document.getElementById("cloud-code");
+  refs.cloudMagicLinkButton = document.getElementById("cloud-magic-link");
+  refs.cloudSignOutButton = document.getElementById("cloud-sign-out");
+  refs.cloudCreateSpaceButton = document.getElementById("cloud-create-space");
+  refs.cloudJoinSpaceButton = document.getElementById("cloud-join-space");
+  refs.cloudPushButton = document.getElementById("cloud-push");
+  refs.cloudPullButton = document.getElementById("cloud-pull");
+  refs.cloudSpaceHint = document.getElementById("cloud-space-hint");
   refs.openSourceButton = document.getElementById("open-source");
   refs.saveSourceButton = document.getElementById("save-source");
   refs.saveDraftButton = document.getElementById("save-draft");
@@ -128,6 +164,24 @@ function cacheDom() {
 
 function bindEvents() {
   refs.fileInput.addEventListener("change", onFileSelected);
+  refs.cloudMagicLinkButton.addEventListener("click", () => {
+    void onCloudMagicLinkRequested();
+  });
+  refs.cloudSignOutButton.addEventListener("click", () => {
+    void onCloudSignOutRequested();
+  });
+  refs.cloudCreateSpaceButton.addEventListener("click", () => {
+    void onCloudCreateSpaceRequested();
+  });
+  refs.cloudJoinSpaceButton.addEventListener("click", () => {
+    void onCloudJoinSpaceRequested();
+  });
+  refs.cloudPushButton.addEventListener("click", () => {
+    void onCloudPublishRequested();
+  });
+  refs.cloudPullButton.addEventListener("click", () => {
+    void onCloudRefreshRequested();
+  });
   refs.openSourceButton.addEventListener("click", onOpenSourceRequested);
   refs.saveSourceButton.addEventListener("click", () => {
     void saveSourceWorkbook();
@@ -263,6 +317,795 @@ function renderAppShellState() {
   refs.appShellStatus.textContent = `${onlineLabel} - L'installation sera proposee quand l'app sera prete${appShellReady ? " - Cache hors ligne pret" : ""}`;
 }
 
+function getSupabaseRuntime() {
+  return window.supabase || null;
+}
+
+function getSupabaseConfig() {
+  const rawConfig = window.BUDGET_SUPABASE_CONFIG || {};
+
+  return {
+    url: String(rawConfig.url || "").trim(),
+    anonKey: String(rawConfig.anonKey || "").trim(),
+    defaultSpaceName: String(rawConfig.defaultSpaceName || "Budget partage 2025").trim() || "Budget partage 2025",
+  };
+}
+
+function hasSupabaseSession() {
+  return Boolean(state.cloud.user);
+}
+
+function hasCloudSpaceSelected() {
+  return Boolean(state.cloud.space.id);
+}
+
+function canUseSupabaseCloud() {
+  return Boolean(supabaseClient && hasSupabaseSession() && hasCloudSpaceSelected());
+}
+
+function hasLocalBudgetData() {
+  return state.mode === "budget" && (
+    state.budget.rows.length > 0 ||
+    state.budget.categories.length > 0 ||
+    state.recap.planTemplate.length > 0
+  );
+}
+
+function buildSupabaseRedirectUrl() {
+  return `${window.location.origin}${window.location.pathname}`;
+}
+
+function setCloudStatus(message) {
+  state.cloud.status = message;
+}
+
+function setCloudBusy(nextBusy) {
+  state.cloud.syncBusy = Boolean(nextBusy);
+}
+
+function clearCloudRefreshTimer() {
+  if (!cloudRefreshTimer) {
+    return;
+  }
+
+  window.clearTimeout(cloudRefreshTimer);
+  cloudRefreshTimer = null;
+}
+
+function queueCloudRefresh() {
+  clearCloudRefreshTimer();
+
+  if (!canUseSupabaseCloud()) {
+    return;
+  }
+
+  cloudRefreshTimer = window.setTimeout(() => {
+    cloudRefreshTimer = null;
+    void loadBudgetFromSupabase(state.cloud.space.id, {
+      silent: true,
+      preserveLastAction: true,
+    }).catch(() => undefined);
+  }, 700);
+}
+
+async function initSupabaseIntegration() {
+  const runtime = getSupabaseRuntime();
+  const config = getSupabaseConfig();
+
+  if (!runtime || !config.url || !config.anonKey) {
+    state.cloud.configured = false;
+    state.cloud.ready = false;
+    setCloudStatus("Supabase non configure. Renseignez supabase.config.js pour activer le partage.");
+    renderAll();
+    return;
+  }
+
+  try {
+    supabaseClient = runtime.createClient(config.url, config.anonKey, {
+      auth: {
+        persistSession: true,
+        autoRefreshToken: true,
+        detectSessionInUrl: true,
+      },
+    });
+    state.cloud.configured = true;
+    state.cloud.ready = true;
+    setCloudStatus("Supabase configure. Connectez-vous pour partager le budget.");
+
+    if (supabaseAuthSubscription?.data?.subscription?.unsubscribe) {
+      supabaseAuthSubscription.data.subscription.unsubscribe();
+    }
+
+    supabaseAuthSubscription = supabaseClient.auth.onAuthStateChange((_event, session) => {
+      state.cloud.session = session || null;
+      state.cloud.user = session?.user || null;
+      if (session?.user?.email) {
+        state.cloud.email = session.user.email;
+      }
+
+      if (!state.cloud.user) {
+        stopSupabaseRealtime();
+        setCloudStatus("Supabase configure. Connectez-vous pour partager le budget.");
+        persistDraftIfPossible();
+        renderAll();
+        return;
+      }
+
+      setCloudStatus(hasCloudSpaceSelected()
+        ? `Connecte a Supabase. Espace actif: ${state.cloud.space.name || state.cloud.space.joinCode || "budget partage"}.`
+        : "Connecte a Supabase. Creez ou rejoignez un espace partage.");
+      persistDraftIfPossible();
+      renderAll();
+
+      if (hasCloudSpaceSelected()) {
+        void attachToCurrentCloudSpace({ silent: true, preserveLastAction: true });
+      }
+    });
+
+    await syncSupabaseSession();
+  } catch (error) {
+    console.error(error);
+    state.cloud.configured = false;
+    state.cloud.ready = false;
+    setCloudStatus("Supabase n'a pas pu etre initialise.");
+    renderAll();
+  }
+}
+
+async function syncSupabaseSession() {
+  if (!supabaseClient) {
+    return;
+  }
+
+  const { data, error } = await supabaseClient.auth.getSession();
+  if (error) {
+    console.error(error);
+    setCloudStatus("Connexion Supabase indisponible pour le moment.");
+    renderAll();
+    return;
+  }
+
+  state.cloud.session = data.session || null;
+  state.cloud.user = data.session?.user || null;
+  if (data.session?.user?.email) {
+    state.cloud.email = data.session.user.email;
+  }
+
+  if (state.cloud.user) {
+    setCloudStatus(hasCloudSpaceSelected()
+      ? `Connecte a Supabase. Espace actif: ${state.cloud.space.name || state.cloud.space.joinCode || "budget partage"}.`
+      : "Connecte a Supabase. Creez ou rejoignez un espace partage.");
+    if (hasCloudSpaceSelected()) {
+      await attachToCurrentCloudSpace({
+        silent: true,
+        preserveLastAction: true,
+      });
+    }
+  }
+
+  renderAll();
+}
+
+function normalizeCloudSpaceRecord(record) {
+  return {
+    id: String(record?.space_id || record?.id || "").trim(),
+    name: String(record?.space_name || record?.name || "").trim(),
+    joinCode: String(record?.join_code || record?.joinCode || "").trim(),
+  };
+}
+
+function applyCloudSpaceRecord(record) {
+  const normalized = normalizeCloudSpaceRecord(record);
+  state.cloud.space = normalized;
+
+  if (refs.cloudCodeInput) {
+    refs.cloudCodeInput.value = normalized.joinCode;
+  }
+}
+
+function persistDraftIfPossible() {
+  if (state.mode === "budget") {
+    persistDraft();
+  }
+}
+
+async function onCloudMagicLinkRequested() {
+  if (!supabaseClient || !state.cloud.ready) {
+    setLastAction("Supabase n'est pas encore configure.");
+    renderAll();
+    return;
+  }
+
+  const email = String(refs.cloudEmailInput.value || "").trim().toLowerCase();
+  if (!email) {
+    setLastAction("Saisissez votre email pour recevoir le lien magique.");
+    renderAll();
+    return;
+  }
+
+  try {
+    state.cloud.email = email;
+    setCloudBusy(true);
+    setCloudStatus("Envoi du lien magique en cours...");
+    renderAll();
+
+    const { error } = await supabaseClient.auth.signInWithOtp({
+      email,
+      options: {
+        emailRedirectTo: buildSupabaseRedirectUrl(),
+      },
+    });
+
+    if (error) {
+      throw error;
+    }
+
+    setCloudStatus(`Lien magique envoye a ${email}. Ouvrez votre email pour terminer la connexion.`);
+    setLastAction(`Lien magique Supabase envoye a ${email}`);
+  } catch (error) {
+    console.error(error);
+    setCloudStatus("Le lien magique n'a pas pu etre envoye.");
+    setLastAction("Connexion Supabase impossible");
+  } finally {
+    setCloudBusy(false);
+    renderAll();
+  }
+}
+
+async function onCloudSignOutRequested() {
+  if (!supabaseClient || !hasSupabaseSession()) {
+    setLastAction("Aucune session Supabase active.");
+    renderAll();
+    return;
+  }
+
+  try {
+    setCloudBusy(true);
+    const { error } = await supabaseClient.auth.signOut();
+    if (error) {
+      throw error;
+    }
+
+    stopSupabaseRealtime();
+    state.cloud.session = null;
+    state.cloud.user = null;
+    setCloudStatus("Session Supabase fermee.");
+    setLastAction("Deconnexion Supabase terminee");
+  } catch (error) {
+    console.error(error);
+    setCloudStatus("La deconnexion Supabase a echoue.");
+    setLastAction("Deconnexion Supabase impossible");
+  } finally {
+    setCloudBusy(false);
+    renderAll();
+  }
+}
+
+async function onCloudCreateSpaceRequested() {
+  if (!supabaseClient || !hasSupabaseSession()) {
+    setLastAction("Connectez-vous d'abord a Supabase.");
+    renderAll();
+    return;
+  }
+
+  const suggestedName = state.workbookName
+    ? state.workbookName.replace(/\.(xlsx|xls|csv)$/i, "")
+    : getSupabaseConfig().defaultSpaceName;
+  const desiredName = String(window.prompt("Nom du budget partage", suggestedName) || "").trim();
+
+  if (!desiredName) {
+    setLastAction("Creation d'espace annulee.");
+    renderAll();
+    return;
+  }
+
+  try {
+    setCloudBusy(true);
+    setCloudStatus("Creation de l'espace partage...");
+    renderAll();
+
+    const { data, error } = await supabaseClient.rpc("create_budget_space", {
+      space_name: desiredName,
+    });
+
+    if (error) {
+      throw error;
+    }
+
+    const createdSpace = Array.isArray(data) ? data[0] : data;
+    applyCloudSpaceRecord(createdSpace);
+    setCloudStatus(`Espace partage cree: ${state.cloud.space.name}.`);
+    setLastAction(`Espace cloud cree: ${state.cloud.space.name}`);
+
+    await attachToCurrentCloudSpace({
+      silent: true,
+      preserveLastAction: true,
+    });
+
+    if (hasLocalBudgetData()) {
+      const publishNow = window.confirm("Publier vos donnees locales actuelles vers ce nouvel espace partage ?");
+      if (publishNow) {
+        await publishLocalBudgetToSupabase();
+      }
+    }
+  } catch (error) {
+    console.error(error);
+    setCloudStatus("L'espace partage n'a pas pu etre cree.");
+    setLastAction("Creation de l'espace cloud impossible");
+  } finally {
+    setCloudBusy(false);
+    renderAll();
+  }
+}
+
+async function onCloudJoinSpaceRequested() {
+  if (!supabaseClient || !hasSupabaseSession()) {
+    setLastAction("Connectez-vous d'abord a Supabase.");
+    renderAll();
+    return;
+  }
+
+  const joinCode = String(refs.cloudCodeInput.value || "").trim().toLowerCase();
+  if (!joinCode) {
+    setLastAction("Saisissez le code de l'espace partage.");
+    renderAll();
+    return;
+  }
+
+  try {
+    setCloudBusy(true);
+    setCloudStatus("Rejointure de l'espace partage...");
+    renderAll();
+
+    const { data, error } = await supabaseClient.rpc("join_budget_space", {
+      space_join_code: joinCode,
+    });
+
+    if (error) {
+      throw error;
+    }
+
+    const joinedSpace = Array.isArray(data) ? data[0] : data;
+    applyCloudSpaceRecord(joinedSpace);
+    setCloudStatus(`Espace partage rejoint: ${state.cloud.space.name}.`);
+    setLastAction(`Espace cloud rejoint: ${state.cloud.space.name}`);
+
+    const shouldLoadCloud = !hasLocalBudgetData() ||
+      window.confirm("Charger les donnees de cet espace cloud et remplacer les donnees locales visibles ?");
+
+    if (shouldLoadCloud) {
+      await loadBudgetFromSupabase(state.cloud.space.id, {
+        silent: true,
+        preserveLastAction: true,
+      });
+    } else {
+      await attachToCurrentCloudSpace({
+        silent: true,
+        preserveLastAction: true,
+      });
+    }
+  } catch (error) {
+    console.error(error);
+    setCloudStatus("Impossible de rejoindre cet espace partage.");
+    setLastAction("Rejointure cloud impossible");
+  } finally {
+    setCloudBusy(false);
+    renderAll();
+  }
+}
+
+async function onCloudPublishRequested() {
+  if (!canUseSupabaseCloud()) {
+    setLastAction("Connectez-vous et choisissez un espace cloud avant la publication.");
+    renderAll();
+    return;
+  }
+
+  if (!hasLocalBudgetData()) {
+    setLastAction("Aucune donnee locale a publier vers Supabase.");
+    renderAll();
+    return;
+  }
+
+  await publishLocalBudgetToSupabase();
+}
+
+async function onCloudRefreshRequested() {
+  if (!canUseSupabaseCloud()) {
+    setLastAction("Connectez-vous et choisissez un espace cloud avant de recharger.");
+    renderAll();
+    return;
+  }
+
+  try {
+    setCloudBusy(true);
+    await loadBudgetFromSupabase(state.cloud.space.id);
+    setLastAction("Budget recharge depuis Supabase.");
+  } catch (error) {
+    console.error(error);
+    setLastAction("Le rechargement depuis Supabase a echoue.");
+  } finally {
+    setCloudBusy(false);
+    renderAll();
+  }
+}
+
+async function attachToCurrentCloudSpace(options = {}) {
+  if (!canUseSupabaseCloud()) {
+    return;
+  }
+
+  await loadCloudSpaceMetadata(state.cloud.space.id, options);
+  startSupabaseRealtime(state.cloud.space.id);
+}
+
+async function loadCloudSpaceMetadata(spaceId, options = {}) {
+  if (!supabaseClient || !spaceId) {
+    return;
+  }
+
+  const { data, error } = await supabaseClient
+    .from("budget_spaces")
+    .select("id, name, join_code")
+    .eq("id", spaceId)
+    .maybeSingle();
+
+  if (error) {
+    console.error(error);
+    if (!options.silent) {
+      setCloudStatus("Impossible de lire les informations de l'espace Supabase.");
+    }
+    renderAll();
+    return;
+  }
+
+  if (data) {
+    applyCloudSpaceRecord(data);
+    if (!options.silent) {
+      setCloudStatus(`Espace partage actif: ${state.cloud.space.name}.`);
+    }
+    persistDraftIfPossible();
+    renderAll();
+  }
+}
+
+function startSupabaseRealtime(spaceId) {
+  if (!supabaseClient || !spaceId) {
+    return;
+  }
+
+  const currentTopic = `budget-space-${spaceId}`;
+  if (supabaseRealtimeChannel?.topic === currentTopic) {
+    return;
+  }
+
+  stopSupabaseRealtime();
+
+  supabaseRealtimeChannel = supabaseClient
+    .channel(currentTopic)
+    .on("postgres_changes", {
+      event: "*",
+      schema: "public",
+      table: "budget_transactions",
+      filter: `space_id=eq.${spaceId}`,
+    }, queueCloudRefresh)
+    .on("postgres_changes", {
+      event: "*",
+      schema: "public",
+      table: "budget_categories",
+      filter: `space_id=eq.${spaceId}`,
+    }, queueCloudRefresh)
+    .on("postgres_changes", {
+      event: "*",
+      schema: "public",
+      table: "budget_plan_rows",
+      filter: `space_id=eq.${spaceId}`,
+    }, queueCloudRefresh)
+    .subscribe();
+}
+
+function stopSupabaseRealtime() {
+  clearCloudRefreshTimer();
+
+  if (!supabaseRealtimeChannel || !supabaseClient) {
+    supabaseRealtimeChannel = null;
+    return;
+  }
+
+  supabaseClient.removeChannel(supabaseRealtimeChannel);
+  supabaseRealtimeChannel = null;
+}
+
+async function publishLocalBudgetToSupabase() {
+  if (!canUseSupabaseCloud()) {
+    return;
+  }
+
+  try {
+    setCloudBusy(true);
+    setCloudStatus(`Publication en cours vers ${state.cloud.space.name || "l'espace partage"}...`);
+    renderAll();
+
+    const spaceId = state.cloud.space.id;
+    const categoriesPayload = buildSupabaseCategoryPayload(spaceId);
+    const planPayload = buildSupabasePlanPayload(spaceId);
+    const transactionsPayload = buildSupabaseTransactionPayload(spaceId);
+
+    let query = supabaseClient.from("budget_transactions").delete();
+    let { error } = await query.eq("space_id", spaceId);
+    if (error) {
+      throw error;
+    }
+
+    query = supabaseClient.from("budget_categories").delete();
+    ({ error } = await query.eq("space_id", spaceId));
+    if (error) {
+      throw error;
+    }
+
+    query = supabaseClient.from("budget_plan_rows").delete();
+    ({ error } = await query.eq("space_id", spaceId));
+    if (error) {
+      throw error;
+    }
+
+    if (categoriesPayload.length) {
+      ({ error } = await supabaseClient.from("budget_categories").insert(categoriesPayload));
+      if (error) {
+        throw error;
+      }
+    }
+
+    if (planPayload.length) {
+      ({ error } = await supabaseClient.from("budget_plan_rows").insert(planPayload));
+      if (error) {
+        throw error;
+      }
+    }
+
+    if (transactionsPayload.length) {
+      ({ error } = await supabaseClient.from("budget_transactions").upsert(transactionsPayload));
+      if (error) {
+        throw error;
+      }
+    }
+
+    state.cloud.lastPushedAt = new Date().toISOString();
+    setCloudStatus(`Budget publie vers ${state.cloud.space.name}.`);
+    setLastAction(`Donnees locales publiees vers ${state.cloud.space.name}`);
+    persistDraftIfPossible();
+  } catch (error) {
+    console.error(error);
+    setCloudStatus("La publication vers Supabase a echoue.");
+    setLastAction("Publication Supabase impossible");
+  } finally {
+    setCloudBusy(false);
+    renderAll();
+  }
+}
+
+async function loadBudgetFromSupabase(spaceId, options = {}) {
+  if (!supabaseClient || !spaceId) {
+    return;
+  }
+
+  try {
+    if (!options.silent) {
+      setCloudStatus("Chargement des donnees cloud...");
+      renderAll();
+    }
+
+    const [{ data: categories, error: categoriesError }, { data: planRows, error: planError }, { data: transactions, error: transactionsError }] = await Promise.all([
+      supabaseClient
+        .from("budget_categories")
+        .select("name, position")
+        .eq("space_id", spaceId)
+        .order("position", { ascending: true })
+        .order("name", { ascending: true }),
+      supabaseClient
+        .from("budget_plan_rows")
+        .select("label, plan_amount, position")
+        .eq("space_id", spaceId)
+        .order("position", { ascending: true })
+        .order("label", { ascending: true }),
+      supabaseClient
+        .from("budget_transactions")
+        .select("id, entry_date, category, amount, sort_order")
+        .eq("space_id", spaceId)
+        .order("sort_order", { ascending: true })
+        .order("entry_date", { ascending: true })
+        .order("created_at", { ascending: true }),
+    ]);
+
+    if (categoriesError) {
+      throw categoriesError;
+    }
+
+    if (planError) {
+      throw planError;
+    }
+
+    if (transactionsError) {
+      throw transactionsError;
+    }
+
+    state.mode = "budget";
+    state.workbookName = state.workbookName || state.cloud.space.name || "Budget partage cloud";
+    state.workbook = null;
+    state.sourceLink = null;
+    state.sourceSafety = createEmptySourceSafety();
+    state.activeView = normalizeActiveView(state.activeView);
+    state.search = "";
+    state.editingIndex = null;
+    state.editorMode = "create";
+    state.budget = {
+      headers: ["Date", "Categories", "Value"],
+      categories: (categories || []).map((row) => String(row.name || "").trim()).filter(Boolean),
+      rows: (transactions || []).map((row) => sanitizeBudgetRow({
+        __id: row.id,
+        Date: row.entry_date,
+        Categories: row.category,
+        Value: normalizeAmountValue(row.amount),
+      })),
+      clearEndRow: START_ROW + (transactions?.length || 0) + 8,
+    };
+    state.recap = {
+      available: true,
+      snapshotDate: `Supabase - ${formatDraftSavedAt(new Date().toISOString())}`,
+      planTemplate: (planRows || []).map((row) => ({
+        label: String(row.label || "").trim(),
+        plan: normalizeAmountValue(row.plan_amount),
+      })).filter((row) => row.label),
+    };
+    state.cloud.lastPulledAt = new Date().toISOString();
+
+    if (!options.preserveLastAction) {
+      setLastAction(`Budget charge depuis ${state.cloud.space.name || "Supabase"}`);
+    }
+
+    setCloudStatus(`Espace partage actif: ${state.cloud.space.name || "budget partage"}.`);
+    persistDraft();
+    startSupabaseRealtime(spaceId);
+    renderAll();
+  } catch (error) {
+    console.error(error);
+    if (!options.silent) {
+      setCloudStatus("Le chargement des donnees cloud a echoue.");
+      renderAll();
+    }
+    throw error;
+  }
+}
+
+function buildSupabaseCategoryPayload(spaceId) {
+  const categories = new Set();
+  const ordered = [];
+
+  state.budget.categories.forEach((category) => {
+    const normalized = String(category || "").trim();
+    if (!normalized || categories.has(normalized)) {
+      return;
+    }
+
+    categories.add(normalized);
+    ordered.push(normalized);
+  });
+
+  state.budget.rows.forEach((row) => {
+    const normalized = String(row.Categories || "").trim();
+    if (!normalized || categories.has(normalized)) {
+      return;
+    }
+
+    categories.add(normalized);
+    ordered.push(normalized);
+  });
+
+  return ordered.map((name, index) => ({
+    space_id: spaceId,
+    name,
+    position: index,
+  }));
+}
+
+function buildSupabasePlanPayload(spaceId) {
+  return state.recap.planTemplate
+    .map((row, index) => ({
+      space_id: spaceId,
+      label: String(row.label || "").trim(),
+      plan_amount: Number.isFinite(parseAmount(row.plan)) ? parseAmount(row.plan) : null,
+      position: index,
+    }))
+    .filter((row) => row.label);
+}
+
+function buildSupabaseTransactionPayload(spaceId) {
+  return state.budget.rows
+    .map((row, index) => ({
+      id: String(row.__id || createId()),
+      space_id: spaceId,
+      entry_date: normalizeDateValue(row.Date) || null,
+      category: String(row.Categories || "").trim(),
+      amount: Number.isFinite(parseAmount(row.Value)) ? parseAmount(row.Value) : null,
+      sort_order: index,
+    }))
+    .filter((row) => row.category || Number.isFinite(row.amount) || row.entry_date);
+}
+
+async function syncSingleTransactionToSupabase(record) {
+  if (!canUseSupabaseCloud()) {
+    return;
+  }
+
+  const categoryName = String(record.Categories || "").trim();
+
+  if (categoryName) {
+    const knownCategories = buildSupabaseCategoryPayload(state.cloud.space.id);
+    const targetCategory = knownCategories.find((row) => row.name === categoryName) || {
+      space_id: state.cloud.space.id,
+      name: categoryName,
+      position: knownCategories.length,
+    };
+
+    const { error: categoryError } = await supabaseClient
+      .from("budget_categories")
+      .upsert(targetCategory, {
+        onConflict: "space_id,name",
+      });
+
+    if (categoryError) {
+      throw categoryError;
+    }
+  }
+
+  const payload = {
+    id: String(record.__id || createId()),
+    space_id: state.cloud.space.id,
+    entry_date: normalizeDateValue(record.Date) || null,
+    category: categoryName,
+    amount: Number.isFinite(parseAmount(record.Value)) ? parseAmount(record.Value) : null,
+    sort_order: Math.max(0, state.budget.rows.findIndex((row) => row.__id === record.__id)),
+  };
+
+  const { error } = await supabaseClient
+    .from("budget_transactions")
+    .upsert(payload);
+
+  if (error) {
+    throw error;
+  }
+
+  state.cloud.lastPushedAt = new Date().toISOString();
+  setCloudStatus(`Derniere transaction synchronisee vers ${state.cloud.space.name || "Supabase"}.`);
+  persistDraftIfPossible();
+}
+
+async function removeSingleTransactionFromSupabase(recordId) {
+  if (!canUseSupabaseCloud()) {
+    return;
+  }
+
+  const { error } = await supabaseClient
+    .from("budget_transactions")
+    .delete()
+    .eq("space_id", state.cloud.space.id)
+    .eq("id", String(recordId || ""));
+
+  if (error) {
+    throw error;
+  }
+
+  state.cloud.lastPushedAt = new Date().toISOString();
+  setCloudStatus(`Suppression synchronisee vers ${state.cloud.space.name || "Supabase"}.`);
+  persistDraftIfPossible();
+}
+
+function enqueueCloudSync(task) {
+  const nextTask = cloudSyncQueue.then(() => task());
+  cloudSyncQueue = nextTask.catch(() => undefined);
+  return nextTask;
+}
+
 function isStandaloneMode() {
   return window.matchMedia?.("(display-mode: standalone)")?.matches || window.navigator.standalone === true;
 }
@@ -303,6 +1146,12 @@ function persistDraft() {
       snapshotDate: state.recap.snapshotDate,
       planTemplate: state.recap.planTemplate,
     },
+    cloud: {
+      email: state.cloud.email,
+      space: state.cloud.space,
+      lastPulledAt: state.cloud.lastPulledAt,
+      lastPushedAt: state.cloud.lastPushedAt,
+    },
     recapFilters: state.recapFilters,
     savedAt: new Date().toISOString(),
   };
@@ -340,6 +1189,14 @@ function applyStoredDraft(draft) {
     year: String(draft.recapFilters?.year || "all"),
     month: String(draft.recapFilters?.month || "all"),
   };
+  state.cloud.email = String(draft.cloud?.email || state.cloud.email || "");
+  state.cloud.space = {
+    id: String(draft.cloud?.space?.id || state.cloud.space.id || ""),
+    name: String(draft.cloud?.space?.name || state.cloud.space.name || ""),
+    joinCode: String(draft.cloud?.space?.joinCode || draft.cloud?.space?.join_code || state.cloud.space.joinCode || ""),
+  };
+  state.cloud.lastPulledAt = String(draft.cloud?.lastPulledAt || state.cloud.lastPulledAt || "");
+  state.cloud.lastPushedAt = String(draft.cloud?.lastPushedAt || state.cloud.lastPushedAt || "");
   state.sourceSafety = createEmptySourceSafety();
   state.draftSavedAt = String(draft.savedAt || "");
 
@@ -842,6 +1699,13 @@ async function deleteRecord(index) {
   const actionLabel = `Transaction supprimee: ${title}`;
   setLastAction(actionLabel);
   renderAll();
+  try {
+    await enqueueCloudSync(() => removeSingleTransactionFromSupabase(target.__id));
+  } catch (error) {
+    console.error(error);
+    setLastAction(`${actionLabel} - sync cloud en echec`);
+    renderAll();
+  }
   await enqueueSourceSave({
     automatic: true,
     baseAction: actionLabel,
@@ -887,6 +1751,13 @@ async function onSaveRecord(event) {
 
   persistDraft();
   renderAll();
+  try {
+    await enqueueCloudSync(() => syncSingleTransactionToSupabase(nextRecord));
+  } catch (error) {
+    console.error(error);
+    setLastAction(`${actionLabel} - sync cloud en echec`);
+    renderAll();
+  }
   await enqueueSourceSave({
     automatic: true,
     baseAction: actionLabel,
@@ -1415,6 +2286,7 @@ function renderAll() {
   renderCards();
   renderEditor();
   renderControls();
+  renderCloudPanel();
   renderDraftStatus();
   renderAppShellState();
 }
@@ -1552,6 +2424,52 @@ function renderControls() {
   refs.cancelButton.disabled = !journalActive;
 }
 
+function renderCloudPanel() {
+  const cloudReady = state.cloud.ready;
+  const signedIn = hasSupabaseSession();
+  const spaceSelected = hasCloudSpaceSelected();
+  const busy = state.cloud.syncBusy;
+  const canPublish = canUseSupabaseCloud() && hasLocalBudgetData();
+
+  refs.cloudStatus.textContent = state.cloud.status;
+  refs.cloudEmailInput.value = refs.cloudEmailInput.matches(":focus")
+    ? refs.cloudEmailInput.value
+    : state.cloud.email;
+  refs.cloudCodeInput.value = refs.cloudCodeInput.matches(":focus")
+    ? refs.cloudCodeInput.value
+    : state.cloud.space.joinCode;
+
+  refs.cloudEmailInput.disabled = !cloudReady || busy || signedIn;
+  refs.cloudCodeInput.disabled = !cloudReady || busy || !signedIn;
+  refs.cloudMagicLinkButton.disabled = !cloudReady || busy || signedIn;
+  refs.cloudSignOutButton.disabled = !cloudReady || busy || !signedIn;
+  refs.cloudCreateSpaceButton.disabled = !cloudReady || busy || !signedIn;
+  refs.cloudJoinSpaceButton.disabled = !cloudReady || busy || !signedIn;
+  refs.cloudPushButton.disabled = !canPublish || busy;
+  refs.cloudPullButton.disabled = !canUseSupabaseCloud() || busy;
+
+  refs.cloudMagicLinkButton.textContent = busy && !signedIn ? "Connexion..." : "Lien magique";
+  refs.cloudSignOutButton.textContent = busy && signedIn ? "Patientez..." : "Deconnexion";
+
+  const identityLabel = signedIn
+    ? `Compte: ${state.cloud.user?.email || state.cloud.email || "connecte"}`
+    : "Compte: non connecte";
+  const spaceLabel = spaceSelected
+    ? `Espace: ${state.cloud.space.name || "budget partage"}`
+    : "Espace: aucun";
+  const codeLabel = spaceSelected && state.cloud.space.joinCode
+    ? `Code partage: ${state.cloud.space.joinCode}`
+    : "Code partage: a creer ou rejoindre";
+  const pullLabel = state.cloud.lastPulledAt
+    ? `Dernier chargement: ${formatDraftSavedAt(state.cloud.lastPulledAt)}`
+    : "Dernier chargement: aucun";
+  const pushLabel = state.cloud.lastPushedAt
+    ? `Derniere publication: ${formatDraftSavedAt(state.cloud.lastPushedAt)}`
+    : "Derniere publication: aucune";
+
+  refs.cloudSpaceHint.textContent = [identityLabel, spaceLabel, codeLabel, pullLabel, pushLabel].join(" | ");
+}
+
 function renderDraftStatus() {
   const draft = readStoredDraft();
   const hasStoredDraft = Boolean(draft && draft.mode === "budget" && Array.isArray(draft.rows));
@@ -1563,6 +2481,11 @@ function renderDraftStatus() {
 
   const savedAtLabel = formatDraftSavedAt(draft.savedAt);
   const suffix = savedAtLabel ? ` Derniere sauvegarde ${savedAtLabel}.` : "";
+
+  if (canUseSupabaseCloud()) {
+    refs.draftStatus.textContent = `Mode cloud partage actif.${suffix}`;
+    return;
+  }
 
   if (state.mode === "budget" && !state.workbook) {
     refs.draftStatus.textContent = `Mode autonome local actif.${suffix}`;
@@ -1638,6 +2561,10 @@ function getExportCapabilityLabel() {
 }
 
 function getSaveCapabilityLabel() {
+  if (canUseSupabaseCloud()) {
+    return "Supabase partage actif";
+  }
+
   if (canSaveToSource()) {
     return "Source liee - auto-save actif";
   }
@@ -1658,6 +2585,15 @@ function getSaveCapabilityLabel() {
 }
 
 function buildWorkbookLabel() {
+  if (hasCloudSpaceSelected()) {
+    const cloudName = state.cloud.space.name || state.cloud.space.joinCode || "Budget partage";
+    if (state.workbookName) {
+      return `${cloudName} - cloud partage`;
+    }
+
+    return `${cloudName} - cloud partage`;
+  }
+
   if (!state.workbookName) {
     return state.mode === "budget" ? "Donnees locales" : "Aucun fichier";
   }
@@ -2710,7 +3646,9 @@ function renderEditor() {
 
   refs.formSubtitle.textContent = state.workbook
     ? "Ajoutez ou modifiez vos transactions. Les vues de recap et de comparaison se recalculent aussitot."
-    : "Mode autonome local. Ajoutez ou modifiez vos transactions, les graphiques se mettent a jour aussitot et l'export reste disponible.";
+    : canUseSupabaseCloud()
+      ? "Mode cloud partage. Ajoutez ou modifiez vos transactions, Supabase les republie pour les autres personnes."
+      : "Mode autonome local. Ajoutez ou modifiez vos transactions, les graphiques se mettent a jour aussitot et l'export reste disponible.";
 
   const editingRow =
     state.editorMode === "edit" &&
@@ -2727,7 +3665,9 @@ function renderEditor() {
   refs.formTitle.textContent = state.editorMode === "edit" ? "Modifier la transaction" : "Nouvelle transaction";
   refs.formSubtitle.textContent = state.workbook
     ? "Saisie directe de Journalier!D:F avec categories predefinies depuis la colonne B."
-    : "Mode autonome local: vos categories, recapitulatifs et graphiques se mettent a jour a chaque enregistrement.";
+    : canUseSupabaseCloud()
+      ? "Mode cloud partage: chaque enregistrement met a jour vos vues locales et synchronise Supabase."
+      : "Mode autonome local: vos categories, recapitulatifs et graphiques se mettent a jour a chaque enregistrement.";
   refs.formFields.innerHTML = "";
 
   appendField(renderDateField(editingRow.Date));

@@ -1,4 +1,4 @@
-const VERSION = "budget-card-view-v2";
+const VERSION = "budget-card-view-v3";
 const SHELL_CACHE = `${VERSION}-shell`;
 const RUNTIME_CACHE = `${VERSION}-runtime`;
 const APP_SHELL = [
@@ -6,11 +6,13 @@ const APP_SHELL = [
   "./index.html",
   "./styles.css",
   "./app.js",
+  "./supabase.config.js",
   "./vendor/capacitor.js",
   "./vendor/synapse.js",
   "./vendor/capacitor-filesystem.js",
   "./vendor/capacitor-share.js",
   "./vendor/xlsx.full.min.js",
+  "./vendor/supabase.js",
   "./manifest.json",
   "./offline.html",
   "./apple-touch-icon.png",

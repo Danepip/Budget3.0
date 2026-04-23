@@ -20,6 +20,8 @@
   <script src="vendor/capacitor-filesystem.js"></script>
   <script src="vendor/capacitor-share.js"></script>
   <script src="vendor/xlsx.full.min.js"></script>
+  <script src="supabase.config.js"></script>
+  <script src="vendor/supabase.js"></script>
   <script defer src="app.js"></script>
 </head>
 <body>
@@ -108,6 +110,43 @@
             Aucun brouillon local memorise.
           </p>
         </div>
+      </section>
+
+      <section class="cloud-panel panel">
+        <div class="section-heading cloud-heading">
+          <div>
+            <p class="section-kicker">Supabase Beta</p>
+            <h2>Budget partage en ligne</h2>
+          </div>
+          <p id="cloud-status" class="section-caption">
+            Supabase non configure. Renseignez supabase.config.js pour activer le partage.
+          </p>
+        </div>
+
+        <div class="cloud-grid">
+          <label class="control-field">
+            <span>Email pour lien magique</span>
+            <input id="cloud-email" type="email" placeholder="vous@exemple.com" autocomplete="email">
+          </label>
+
+          <label class="control-field">
+            <span>Code espace partage</span>
+            <input id="cloud-code" type="text" placeholder="code a partager" spellcheck="false" autocomplete="off">
+          </label>
+
+          <div class="cloud-actions">
+            <button id="cloud-magic-link" class="button secondary" type="button">Lien magique</button>
+            <button id="cloud-sign-out" class="button ghost" type="button" disabled>Deconnexion</button>
+            <button id="cloud-create-space" class="button secondary" type="button" disabled>Creer espace</button>
+            <button id="cloud-join-space" class="button ghost" type="button" disabled>Rejoindre</button>
+            <button id="cloud-push" class="button primary" type="button" disabled>Publier local</button>
+            <button id="cloud-pull" class="button ghost" type="button" disabled>Recharger cloud</button>
+          </div>
+        </div>
+
+        <p id="cloud-space-hint" class="draft-status cloud-note">
+          Compte: non connecte | Espace: aucun | Code partage: a creer ou rejoindre | Dernier chargement: aucun | Derniere publication: aucune
+        </p>
       </section>
 
       <section class="status-strip">
